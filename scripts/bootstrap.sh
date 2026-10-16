@@ -49,12 +49,20 @@ if [[ $source == build ]]; then
 	want="$(go env GOPATH 2>/dev/null)/bin/juju" || want=""
 	got=$(command -v juju) || got=""
 	[[ -n $got && $got == "$want" ]] || setup_fail "build mode: juju on PATH is '${got:-none}', expected the built $want"
-	if timeout 30 snap list juju >/dev/null 2>&1; then
+	# Fail closed: only snapd's own "no matching snaps" answer means no snap.
+	snap_rc=0
+	snap_err=$(timeout 30 snap list juju 2>&1 >/dev/null) || snap_rc=$?
+	if ((snap_rc == 0)); then
 		setup_fail "build mode: a juju snap is installed (the run could use it instead of the build)"
+	elif ! { ((snap_rc == 1)) && grep -qi 'no matching snaps installed' <<<"$snap_err"; }; then
+		setup_fail "build mode: could not check for a juju snap (snap list rc $snap_rc)"
 	fi
-	commit=$(timeout 30 juju version --all | sed -n 's/^git-commit: *//p') || commit=""
+	all=$(timeout 30 juju version --all) || all=""
+	commit=$(sed -n 's/^git-commit: *//p' <<<"$all")
+	tree=$(sed -n 's/^git-tree-state: *//p' <<<"$all")
 	[[ $commit == "$ref_sha" ]] || setup_fail "build mode: juju reports git-commit '${commit:-none}', expected ref_sha $ref_sha"
-	echo "identity: $got, git-commit $commit, no juju snap"
+	[[ $tree == clean ]] || setup_fail "build mode: juju reports git-tree-state '${tree:-none}', expected clean"
+	echo "identity: $got, git-commit $commit ($tree), no juju snap"
 	if [[ $cloud == localhost ]]; then
 		extra=(--build-agent)
 		# --build-agent runs make from the juju tree containing the cwd.

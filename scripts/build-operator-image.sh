@@ -7,8 +7,8 @@
 # the hosted runner has podman, which the Makefile prefers and which can't
 # run rootless under `sg`; here docker builds as the runner user and only the
 # import runs under `sg snap_microk8s`.
-# Records the image's ref, config digest (docker image id) and containerd
-# target digest, which bootstrap.sh compares with the controller pod's
+# Records the image's ref, base image digest, config digest (docker image
+# id) and containerd target digest, which bootstrap.sh compares with the controller pod's
 # api-server imageID (design §3: for a tag the local image has the same tag
 # as the public one, so only the digest tells them apart). Exit 2 on failure.
 set -euo pipefail
@@ -27,21 +27,36 @@ image="ghcr.io/juju/jujud-operator:$version"
 echo "make operator-image OCI_BUILDER=docker (output: collect/build-operator-image.log)"
 # The Dockerfile's base image comes from public.ecr.aws, which answers 429
 # ("Data limit exceeded") now and then on shared runner IPs (run 38891822632).
-# Retry that one case once; anything else fails at once.
+# Retry that one case once; anything else fails at once. Each attempt logs to
+# its own file, so a retry's own failure is judged on its own output.
 attempt=1
-until make operator-image OCI_BUILDER=docker >>"$log" 2>&1; do
+: >"$log"
+while :; do
+	alog="$log.$attempt"
+	rc=0
+	make operator-image OCI_BUILDER=docker >"$alog" 2>&1 || rc=$?
+	{
+		echo "=== make operator-image attempt $attempt (rc $rc)"
+		cat "$alog"
+	} >>"$log"
 	rate_limited=0
-	grep -q '429 Too Many Requests' "$log" && rate_limited=1
-	if [ "$rate_limited" = 1 ] && [ "$attempt" -lt 2 ]; then
+	((rc == 0)) || ! grep -q '429 Too Many Requests' "$alog" || rate_limited=1
+	rm -f "$alog"
+	((rc != 0)) || break
+	if ((rate_limited == 1 && attempt < 2)); then
 		attempt=$((attempt + 1))
 		echo "base image registry rate-limited (429); retrying make operator-image in ${LAB_OPERATOR_RETRY_S:-60}s" | tee -a "$log"
 		sleep "${LAB_OPERATOR_RETRY_S:-60}"
 		continue
 	fi
 	tail -n 40 "$log" | "$here/redact.pl" || true
-	[ "$rate_limited" = 1 ] && setup_fail "make operator-image failed: base image registry rate-limited (429) after $attempt attempts (see collect/build-operator-image.log)"
+	((rate_limited == 0)) || setup_fail "make operator-image failed: base image registry rate-limited (429) after $attempt attempts (see collect/build-operator-image.log)"
 	setup_fail "make operator-image failed (see collect/build-operator-image.log in the artifact)"
 done
+# The base image tag in juju's caas/Dockerfile floats; record what buildkit
+# resolved it to (design §4: the verdict pins what reproduces the run).
+base=$(sed -nE 's/^#[0-9]+ \[[0-9]+\/[0-9]+\] FROM ([^ ]+@sha256:[0-9a-f]{64}).*$/\1/p' "$log" | head -n 1)
+[[ $base =~ ^[a-z0-9./-]+(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]] || setup_fail "could not read the operator base image digest from the build log"
 config=$(docker image inspect --format '{{.Id}}' "$image" 2>>"$log") || setup_fail "the build produced no $image (docker image inspect failed)"
 [[ $config =~ ^sha256:[0-9a-f]{64}$ ]] || setup_fail "operator image config digest '$config' is not a sha256 digest"
 # Fixed strings under sg; the image name travels via env.
@@ -57,4 +72,5 @@ state_set build_operator_image_s "$((SECONDS - start))"
 state_set operator_image "$image"
 state_set operator_image_config "$config"
 state_set operator_image_target "$target"
-echo "operator image $image imported: config $config, target $target ($((SECONDS - start))s)"
+state_set operator_image_base "$base"
+echo "operator image $image (base $base) imported: config $config, target $target ($((SECONDS - start))s)"

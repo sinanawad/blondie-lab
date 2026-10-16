@@ -8,25 +8,33 @@ with the build-mode measurements from PR-5.
 All runs on GitHub-hosted `ubuntu-24.04` (root fs 145G), `ref=v4.0.15`
 (`a4e2f02a2931351e25f7d3aef0d331d02a6a0c56`) unless noted.
 
-### Go module cache
+### Go module cache: dropped (owner decision, 2026-10-16)
 
-Run the same build twice: first with an empty cache (miss + save), then again
-(restore). The cache entry for this measurement was saved from the PR branch
-by a temporary drill commit (normally only `main` saves); it is scoped to that
-branch and is not visible to `main` or other branches.
+PR-5 first added a `GOMODCACHE` cache (`actions/cache`, saved from `main`
+only). The cache is **not part of v1**: the owner decided to start without it.
+Revisit if builds prove slow; each build verdict now records
+`build.gomod_download_s` (the part a module cache would save) separately from
+`build.go_install_s`.
 
-| Run | Cache | Restore | `make go-install` | Save | GOMODCACHE | Job |
-|---|---|---|---|---|---|---|
-| [38887047776](https://github.com/sinanawad/blondie-lab/actions/runs/38887047776) | miss | 0 s | 678 s | 18 s | 1658 MB | 1104 s |
-| [38889287194](https://github.com/sinanawad/blondie-lab/actions/runs/38889287194) | exact hit (`gomod-4.0-e1d49fcb…`) | 7 s | 471 s | – | 1659 MB | 1047 s |
+The numbers taken with the cache don't support a clear saving.
+`go_install_s` then included the module download:
 
-- Entry size: 394 MB compressed.
-- Saving: ~207 s (~3.5 min, ~30%) of build time per run with a hit; cost is a
-  7 s restore per run plus an 18 s save once per new `go.sum` on `main`.
-- Decision: **keep the cache** (saving clearly exceeds the save cost).
-- Key: `gomod-<4.x line>-<sha256 of go.sum>`, so 4.0 and 4.1 refs keep separate
-  entries and a ref with a different `go.sum` misses rather than restoring a
-  stale tree.
+| Run | Substrate | Cache | `make go-install` |
+|---|---|---|---|
+| [38884372679](https://github.com/sinanawad/blondie-lab/actions/runs/38884372679) | LXD | miss | 663 s |
+| [38887047776](https://github.com/sinanawad/blondie-lab/actions/runs/38887047776) | LXD | miss (+18 s save, 394 MB entry) | 678 s |
+| [38886533883](https://github.com/sinanawad/blondie-lab/actions/runs/38886533883) | k8s | miss | 687 s |
+| [38889287194](https://github.com/sinanawad/blondie-lab/actions/runs/38889287194) | LXD | exact hit (7 s restore) | 471 s |
+| [38891816974](https://github.com/sinanawad/blondie-lab/actions/runs/38891816974) | LXD | exact hit (13 s restore) | 512 s |
+| [38894668287](https://github.com/sinanawad/blondie-lab/actions/runs/38894668287) | k8s | exact hit (10 s restore) | 670 s |
+| [38884396333](https://github.com/sinanawad/blondie-lab/actions/runs/38884396333) | LXD | miss (v4.0.14) | 420 s |
+
+Runner-to-runner variance (420–760 s for the same inputs) is larger than the
+apparent hit/miss difference. The k8s pair differs by 17 s, and one uncached
+run was faster than both cached LXD runs. A cached GOMODCACHE is 1658 MB on
+disk and 394 MB compressed per `go.sum`. Earlier text here said a different
+`go.sum` "misses"; that was wrong, because `restore-keys` restored the nearest
+entry. That no longer matters now that the cache is gone.
 
 ### Build and bootstrap times
 

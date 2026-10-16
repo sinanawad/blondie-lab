@@ -697,6 +697,49 @@ done
 n_calls=$(grep -c 'scripts/bootstrap.sh"*$' .github/workflows/_run.yml)
 if [[ $n_calls == 3 && $n_boot == 2 ]]; then pass "budget: all bootstrap.sh steps checked"; else bad "budget: $n_calls bootstrap.sh call lines, $n_boot steps checked"; fi
 
+# Job backstop (design §2): the worst-case sum of step timeouts on each path
+# must fit the job's timeout-minutes, so a job cancel never eats collect/upload.
+# The scenario step's timeout is an expression capped by validate.sh at
+# BUDGET_MAX (120). Every step must have its own timeout-minutes.
+wf=.github/workflows/_run.yml
+steps_tm=$(awk '
+	/^      - name: / { if (n != "") print n "\t" (t == "" ? "MISSING" : t); n = substr($0, 15); t = ""; next }
+	/^        timeout-minutes: / && n != "" { t = $2; if (t !~ /^[0-9]+$/) t = 120 }
+	END { if (n != "") print n "\t" (t == "" ? "MISSING" : t) }' "$wf")
+job_tm=$(awk '/^    timeout-minutes: / {print $2; exit}' "$wf")
+if grep -q $'\tMISSING$' <<<"$steps_tm"; then
+	bad "budget: steps without timeout-minutes: $(grep $'\tMISSING$' <<<"$steps_tm" | cut -f1 | tr '\n' ';')"
+fi
+# path_sum <excluded step names, |-separated>: sum over the other steps.
+path_sum() { awk -F'\t' -v ex="$1" 'BEGIN { split(ex, e, "|"); for (i in e) x[e[i]] = 1 } !($1 in x) { s += $2 } END { print s }' <<<"$steps_tm"; }
+bm='Free disk (build mode)|Checkout juju/juju at ref_sha (build mode)|Set up Go (build mode)|Build juju (build mode)|Bootstrap (LXD build mode)'
+declare -A paths=(
+	[lxd-build]='Set up MicroK8s|Install juju snap|Bootstrap'
+	[k8s-build]='Set up LXD|Wait for LXD|Install juju snap|Bootstrap (LXD build mode)'
+	[lxd-snap]="Set up MicroK8s|$bm"
+	[k8s-snap]="Set up LXD|Wait for LXD|$bm"
+)
+worst=0
+for pth in lxd-build k8s-build lxd-snap k8s-snap; do
+	sum=$(path_sum "${paths[$pth]}")
+	((sum > worst)) && worst=$sum
+	if [[ $job_tm =~ ^[0-9]+$ ]] && ((sum <= job_tm)); then :; else bad "budget: $pth step timeouts sum to $sum min > job timeout-minutes ${job_tm:-unset}"; fi
+done
+if [[ $job_tm =~ ^[0-9]+$ ]] && ((worst <= job_tm)) && ((job_tm <= 360)); then
+	pass "budget: worst-case step timeout sum $worst min <= job timeout-minutes $job_tm (<= 360)"
+fi
+# Fail closed (design §8): every step that fetches or runs juju/juju code is
+# gated on the trust step having passed with a SHA, not only on
+# source == build and the implicit success().
+guard="steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''"
+nguard=0
+for name in 'Free disk (build mode)' 'Checkout juju/juju at ref_sha (build mode)' 'Set up Go (build mode)' \
+	'Build juju (build mode)'; do
+	cond=$(awk -v n="      - name: $name" '$0 == n {f = 1; next} f && /^      - name: / {exit} f && /^        if: / {print; exit}' "$wf")
+	if [[ $cond == *"$guard"* ]]; then nguard=$((nguard + 1)); else bad "trust gate: '$name' if: lacks the trust guard ($cond)"; fi
+done
+((nguard == 4)) && pass "trust gate: all 4 build-mode steps require the trust step's success and ref_sha"
+
 # no-models-left.sh on k8s: a labelled model namespace left behind is a fail.
 nml() { # nml <name> [VAR=value...]
 	local n=$1
@@ -743,7 +786,9 @@ p=""
 for a in "$@"; do [[ $a == repos/* ]] && p=$a; done
 echo "$p" >>"$FAKE_LOG"
 nf() { echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
-[[ -n ${FAKE_FAIL:-} && $p == *"$FAKE_FAIL"* ]] && { echo "gh: Server Error (HTTP 502)" >&2; exit 1; }
+[[ -n ${FAKE_SLEEP:-} ]] && sleep "$FAKE_SLEEP"
+[[ -n ${FAKE_FAIL:-} && $p == *"$FAKE_FAIL"* ]] && { echo "${FAKE_FAIL_MSG:-gh: Server Error (HTTP 502)}" >&2; exit 1; }
+[[ -n ${FAKE_COMPARE_404:-} && $p == */compare/* ]] && nf
 case $p in
 */commits/v4.0.15) echo "$A" ;;
 */commits/main) echo "$M" ;;
@@ -810,6 +855,18 @@ trust tests-ref-fork 2 "tests_ref 'fork' ($F): not reachable from juju/juju main
 # "could not complete", never a plain rejection.
 trust api-36probe 2 "trust check could not complete (compare with 3.6" LAB_REF=fork FAKE_FAIL=...3.6
 if ! grep -q 'version.go' "$tmp/tr-fork.gh"; then pass "ref-trust: fork SHA rejected before any file read"; else bad "ref-trust fork read files"; fi
+# Only 404/422 mean "absent": a 403 rate limit or a 429 is "could not complete".
+trust api-403 2 "trust check could not complete (resolve ref: gh: API rate limit exceeded for installation ID 1. (HTTP 403))" \
+	LAB_REF=v4.0.15 FAKE_FAIL=commits/ "FAKE_FAIL_MSG=gh: API rate limit exceeded for installation ID 1. (HTTP 403)"
+trust api-429 2 "trust check could not complete (compare with main: gh: Too Many Requests (HTTP 429))" \
+	LAB_REF=v4.0.15 FAKE_FAIL=compare/ "FAKE_FAIL_MSG=gh: Too Many Requests (HTTP 429)"
+# compare 404 on every branch (no common history anywhere) is a rejection, never trust.
+trust compare-404 2 "not reachable from juju/juju main, 4.1 or 4.0 (fork-only or unknown commit), not trusted" LAB_REF=v4.0.15 FAKE_COMPARE_404=1
+# ref + tests_ref in one run: two resolves, $via reused.
+trust both 0 "tests_ref_sha=$T" LAB_REF=v4.0.15 LAB_TESTS_REF=v3.6.29
+if grep -qx "ref_sha=$A" "$tmp/tr-both/out" && grep -qx 'ref_line=4.0' "$tmp/tr-both/out"; then pass "ref-trust: ref + tests_ref -> both SHAs, ref_line from ref"; else bad "ref-trust both outputs"; cat "$tmp/tr-both/out"; fi
+# A slow API ends with the script's own reason inside the step timeout.
+trust deadline 2 "trust check could not complete (resolve ref: timed out after 1s)" LAB_REF=v4.0.15 LAB_TRUST_DEADLINE_S=1 FAKE_SLEEP=3
 trc=0
 env -i PATH="$PATH" LAB_STATE_DIR="$tmp/tr-none" bash scripts/ref-trust.sh >/dev/null 2>&1 || trc=$?
 if ((trc == 2)); then pass "ref-trust: nothing to check -> exit 2"; else bad "ref-trust empty: rc $trc"; fi
@@ -822,7 +879,7 @@ printf '#!/usr/bin/env bash\n[[ $1 == env && $2 == GOPATH ]] && echo "%s"\n' "$g
 cat >"$gp/bin/juju" <<'FAKE'
 #!/usr/bin/env bash
 case $1 in
-version) printf 'version: %s-ubuntu-amd64\ngit-commit: %s\n' "$FAKE_VERSION" "${FAKE_COMMIT:-}" ;;
+version) printf 'version: %s-ubuntu-amd64\ngit-commit: %s\ngit-tree-state: %s\n' "$FAKE_VERSION" "${FAKE_COMMIT:-}" "${FAKE_TREE-clean}" ;;
 clouds) echo '{"microk8s":{"type":"k8s"}}' ;;
 bootstrap) echo "$PWD $*" >>"$FAKE_LOG"; printf '%s\n' "${FAKE_BOOT_OUT:-}"; exit 0 ;;
 switch) exit 0 ;;
@@ -830,7 +887,13 @@ show-controller) printf '{"lab":{"details":{"agent-version":"%s"}}}\n' "$FAKE_AG
 esac
 FAKE
 # shellcheck disable=SC2016 # fake script text
-printf '#!/usr/bin/env bash\n[[ $1 == list && -n ${FAKE_JUJU_SNAP:-} ]] && { echo juju; exit 0; }\nexit 1\n' >"$tmp/fake-snap-b/snap"
+cat >"$tmp/fake-snap-b/snap" <<'FAKE'
+#!/usr/bin/env bash
+[[ $1 == list && -n ${FAKE_JUJU_SNAP:-} ]] && { echo juju; exit 0; }
+[[ -n ${FAKE_SNAP_RC:-} ]] && { echo "error: cannot communicate with server" >&2; exit "$FAKE_SNAP_RC"; }
+echo "error: no matching snaps installed" >&2
+exit 1
+FAKE
 chmod +x "$gp/bin/juju" "$tmp/fake-go/go" "$tmp/fake-snap-b/snap"
 cfg="sha256:$(printf '1%.0s' {1..64})" tgt="sha256:$(printf '2%.0s' {1..64})"
 # boot_build <name> <cloud> [VAR=value...]: bootstrap.sh in build mode with a
@@ -871,6 +934,15 @@ else
 	bad "bootstrap build snap installed (rc $brc)"
 	cat "$b.out"
 fi
+boot_build snaperr localhost FAKE_AGENT=4.0.14.1 FAKE_SNAP_RC=124
+if ((brc == 2)) && grep -q "could not check for a juju snap (snap list rc 124)" "$b.state/setup-error.txt" && [[ ! -s $tmp/bb.log ]]; then
+	pass "bootstrap build: snap list timeout/error -> setup-error (fails closed)"
+else
+	bad "bootstrap build snap error (rc $brc)"
+	cat "$b.out"
+fi
+boot_build dirtytree localhost FAKE_AGENT=4.0.14.1 FAKE_TREE=dirty
+if ((brc == 2)) && grep -q "git-tree-state 'dirty', expected clean" "$b.state/setup-error.txt" && [[ ! -s $tmp/bb.log ]]; then pass "bootstrap build: git-tree-state dirty -> setup-error before bootstrap"; else bad "bootstrap build dirty (rc $brc)"; cat "$b.out"; fi
 boot_build wrongcommit localhost FAKE_COMMIT="$M"
 if ((brc == 2)) && grep -q "git-commit '$M', expected ref_sha $A" "$b.state/setup-error.txt" && [[ ! -s $tmp/bb.log ]]; then pass "bootstrap build: git-commit != ref_sha -> setup-error before bootstrap"; else bad "bootstrap build commit (rc $brc)"; cat "$b.out"; fi
 # juju first on PATH is not the built one.
@@ -907,6 +979,59 @@ fi
 boot_build k8sagent microk8s FAKE_AGENT=4.0.15 FAKE_API_ID="$cfg"
 if ((brc == 2)) && grep -q "controller agent is 4.0.15, expected the built 4.0.14" "$b.state/setup-error.txt"; then pass "bootstrap build k8s: agent version != built -> setup-error"; else bad "bootstrap build k8s agent (rc $brc)"; cat "$b.out"; fi
 
+# --- build-juju.sh: identity inputs and timings (fake go/make) ---------------------
+bj="$tmp/bj"
+mkdir -p "$bj/src/core/version" "$bj/fake" "$bj/gp/bin"
+printf 'go-install:\n' >"$bj/src/Makefile"
+echo 'const version = "4.0.15"' >"$bj/src/core/version/version.go"
+git -C "$bj/src" init -q && git -C "$bj/src" add -A && git -C "$bj/src" -c user.name=t -c user.email=t@t commit -qm t
+bj_sha=$(git -C "$bj/src" rev-parse HEAD)
+cat >"$bj/fake/go" <<'FAKE'
+#!/usr/bin/env bash
+case "$1 $2" in
+"env GOPATH") echo "$FAKE_GP" ;;
+"env GOMODCACHE") echo "$FAKE_GP/pkg/mod" ;;
+"mod download") echo downloaded ;;
+esac
+FAKE
+cat >"$bj/fake/make" <<'FAKE'
+#!/usr/bin/env bash
+printf '#!/usr/bin/env bash\nprintf "version: 4.0.15-ubuntu-amd64\\ngit-commit: %s\\ngit-tree-state: %s\\n"\n' "$(git rev-parse HEAD)" "${FAKE_BJ_TREE:-clean}" >"$FAKE_GP/bin/juju"
+chmod +x "$FAKE_GP/bin/juju"
+FAKE
+chmod +x "$bj/fake/go" "$bj/fake/make"
+bjrun() { # bjrun <name> [VAR=value...]
+	o="$tmp/bj-$1"
+	shift
+	rm -rf "$o" && mkdir -p "$o/state"
+	bjrc=0
+	env -i PATH="$bj/fake:$PATH" HOME="$tmp" FAKE_GP="$bj/gp" LAB_SRC="$bj/src" LAB_REF_SHA="$bj_sha" LAB_SUBSTRATE=lxd \
+		LAB_ARTIFACT_DIR="$o" LAB_STATE_DIR="$o/state" GITHUB_OUTPUT="$o/out" GITHUB_PATH="$o/path" "$@" bash scripts/build-juju.sh >"$o/log" 2>&1 || bjrc=$?
+}
+bjrun ok
+if ((bjrc == 0)) && grep -q '^gomod_download_s=[0-9]' "$o/state/juju.env" && grep -q '^build_go_install_s=[0-9]' "$o/state/juju.env" &&
+	grep -qx "juju_git_commit=$bj_sha" "$o/state/juju.env"; then
+	pass "build-juju: clean tree -> gomod_download_s and build_go_install_s recorded separately"
+else
+	bad "build-juju ok (rc $bjrc)"
+	cat "$o/log"
+fi
+bjrun gitcommit GIT_COMMIT="$bj_sha"
+if ((bjrc == 2)) && grep -q "GIT_COMMIT must be unset" "$o/state/setup-error.txt"; then pass "build-juju: GIT_COMMIT in the environment -> setup-error (even with the right value)"; else bad "build-juju GIT_COMMIT (rc $bjrc)"; cat "$o/log"; fi
+bjrun treestate GIT_TREE_STATE=clean
+if ((bjrc == 2)) && grep -q "GIT_TREE_STATE must be unset" "$o/state/setup-error.txt"; then pass "build-juju: GIT_TREE_STATE in the environment -> setup-error"; else bad "build-juju GIT_TREE_STATE (rc $bjrc)"; cat "$o/log"; fi
+bjrun builtdirty FAKE_BJ_TREE=dirty
+if ((bjrc == 2)) && grep -q "git-tree-state 'dirty', expected clean" "$o/state/setup-error.txt"; then pass "build-juju: built juju reports a dirty tree -> setup-error"; else bad "build-juju built dirty (rc $bjrc)"; cat "$o/log"; fi
+touch "$bj/src/stray"
+bjrun dirty
+rm -f "$bj/src/stray"
+if ((bjrc == 2)) && grep -q "is not clean before the build" "$o/state/setup-error.txt" && ! grep -q '^gomod_download_s=' "$o/state/juju.env" 2>/dev/null; then
+	pass "build-juju: untracked file in the checkout -> setup-error before any build"
+else
+	bad "build-juju dirty (rc $bjrc)"
+	cat "$o/log"
+fi
+
 # --- resolve-tests.sh: build mode and explicit tests_ref ------------------------------
 rt() { # rt <name> [VAR=value...]
 	local n=$1
@@ -933,22 +1058,22 @@ fi
 # --- verdict.sh: build-mode fields --------------------------------------------------
 art="$tmp/art-build"
 pipeline "$art" scenarios selftest 1
-printf '%s\n' "juju_version=4.0.14" "juju_git_commit=$A" source=build "ref_sha=$A" ref_version=4.0.14 build_go_install_s=600 build_s=700 gomodcache_mb=1500 \
+printf '%s\n' "juju_version=4.0.14" "juju_git_commit=$A" source=build "ref_sha=$A" ref_version=4.0.14 build_go_install_s=600 build_s=700 gomodcache_mb=1500 gomod_download_s=55 \
 	build_operator_image_s=100 "operator_image=ghcr.io/juju/jujud-operator:4.0.14" "operator_image_config=$cfg" "operator_image_target=$tgt" \
+	"operator_image_base=public.ecr.aws/ubuntu/ubuntu:24.04@sha256:$(printf 'b%.0s' {1..64})" \
 	controller_agent_version=4.0.14.1 agent_source=local >"$art.state/juju.env"
 sed -i 's/^needs_juju=0$/needs_juju=1/' "$art.state/valid.env"
 echo ref=v4.0.14 >>"$art.state/valid.env"
-env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd BUILD_CACHE_HIT=false "BUILD_CACHE_KEY=gomod-4.0-$(printf 'f%.0s' {1..64})" \
+env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd \
 	VALIDATE_OUTCOME=success READY_OUTCOME=success SCENARIO_OUTCOME=success bash scripts/verdict.sh >"$tmp/log" 2>&1
-check "verdict: build mode -> source build, ref_sha, juju_channel null, build{timings, cache, operator_image}" "$art" \
-	".source == \"build\" and .ref_sha == \"$A\" and .ref == \"v4.0.14\" and .juju_channel == null and .juju_snap_revision == null and .build.build_s == 700 and .build.go_install_s == 600 and .build.gomodcache_mb == 1500 and .build.gomod_cache.exact_hit == false and (.build.gomod_cache.matched_key | startswith(\"gomod-4.0-\")) and .build.operator_image.config_digest == \"$cfg\" and .controller_agent_version == \"4.0.14.1\""
-art="$tmp/art-buildkey"
+check "verdict: build mode -> source build, ref_sha, juju_channel null, build{timings, operator_image incl. base}, no cache fields" "$art" \
+	".source == \"build\" and .ref_sha == \"$A\" and .ref == \"v4.0.14\" and .juju_channel == null and .juju_snap_revision == null and .build.build_s == 700 and .build.go_install_s == 600 and .build.gomod_download_s == 55 and .build.gomodcache_mb == 1500 and (.build | has(\"gomod_cache\") | not) and .build.operator_image.config_digest == \"$cfg\" and (.build.operator_image.base | endswith(\"@sha256:$(printf 'b%.0s' {1..64})\")) and .controller_agent_version == \"4.0.14.1\""
+art="$tmp/art-buildmin"
 pipeline "$art" scenarios selftest 1
 printf '%s\n' source=build >"$art.state/juju.env"
-# shellcheck disable=SC2016 # literal on purpose: must be dropped, never run
-env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd BUILD_CACHE_HIT=maybe 'BUILD_CACHE_KEY=gomod-$(id)' \
+env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd \
 	VALIDATE_OUTCOME=success READY_OUTCOME=success SCENARIO_OUTCOME=success bash scripts/verdict.sh >"$tmp/log" 2>&1
-check "verdict: odd cache outputs -> null" "$art" '.build.gomod_cache == {"exact_hit": null, "matched_key": null} and .build.operator_image == null'
+check "verdict: build mode with no timings recorded -> null fields, operator_image null" "$art" '.build.build_s == null and .build.gomod_download_s == null and .build.operator_image == null'
 art="$tmp/art-snapsrc"
 pipeline "$art" scenarios selftest 1
 check "verdict: snap/none runs have build null and ref_sha null" "$art" '.build == null and .ref_sha == null'
@@ -1069,9 +1194,12 @@ cat >"$fo/make" <<'FAKE'
 n=$(($(cat "$FAKE_DIR/make.n" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$FAKE_DIR/make.n"
 if ((n <= FAKE_MAKE_FAILS)); then
-	echo "ERROR: failed to solve: $FAKE_MAKE_ERR"
+	err=$FAKE_MAKE_ERR
+	((n > 1)) && err=${FAKE_MAKE_ERR2:-$FAKE_MAKE_ERR}
+	echo "ERROR: failed to solve: $err"
 	exit 1
 fi
+[[ -n ${FAKE_NO_BASE:-} ]] || echo "#5 [1/4] FROM public.ecr.aws/ubuntu/ubuntu:24.04@sha256:$(printf 'b%.0s' {1..64})"
 echo "built"
 FAKE
 cat >"$fo/docker" <<'FAKE'
@@ -1089,16 +1217,20 @@ case $3 in
 esac
 FAKE
 chmod +x "$fo/make" "$fo/docker" "$fo/sg"
-opimg() { # opimg <name> <fails> <err>
+opimg() { # opimg <name> <fails> <err> [VAR=value...]
 	o="$tmp/op-$1"
 	rm -rf "$o" && mkdir -p "$o/collect" "$o/state" "$o/fd"
 	orc=0
-	env -i PATH="$fo:$PATH" FAKE_DIR="$o/fd" FAKE_MAKE_FAILS="$2" FAKE_MAKE_ERR="$3" LAB_OPERATOR_RETRY_S=0 LAB_BUILT_VERSION=4.0.15 \
+	local f=$2 e=$3
+	shift 3
+	env -i PATH="$fo:$PATH" FAKE_DIR="$o/fd" FAKE_MAKE_FAILS="$f" FAKE_MAKE_ERR="$e" "$@" LAB_OPERATOR_RETRY_S=0 LAB_BUILT_VERSION=4.0.15 \
 		LAB_SRC="$tmp/opsrc" LAB_ARTIFACT_DIR="$o" LAB_STATE_DIR="$o/state" bash scripts/build-operator-image.sh >"$o/out" 2>&1 || orc=$?
 }
 opimg r429 1 "429 Too Many Requests"
-if ((orc == 0)) && [[ $(cat "$o/fd/make.n") == 2 ]] && grep -q "^operator_image_target=sha256:d" "$o/state/juju.env"; then
-	pass "operator image: one 429 -> retried once, imported"
+if ((orc == 0)) && [[ $(cat "$o/fd/make.n") == 2 ]] && grep -q "^operator_image_target=sha256:d" "$o/state/juju.env" &&
+	grep -qx "operator_image_base=public.ecr.aws/ubuntu/ubuntu:24.04@sha256:$(printf 'b%.0s' {1..64})" "$o/state/juju.env" &&
+	grep -q '^=== make operator-image attempt 2 (rc 0)' "$o/collect/build-operator-image.log"; then
+	pass "operator image: one 429 -> retried once, imported, base digest recorded, both attempts in the log"
 else
 	bad "operator image 429 retry (rc $orc)"
 	cat "$o/out"
@@ -1110,6 +1242,15 @@ else
 	bad "operator image 429 twice (rc $orc)"
 	cat "$o/out"
 fi
+opimg r429other 2 "429 Too Many Requests" FAKE_MAKE_ERR2="some compile error"
+if ((orc == 2)) && [[ $(cat "$o/fd/make.n") == 2 ]] && grep -qx "make operator-image failed (see collect/build-operator-image.log in the artifact)" "$o/state/setup-error.txt"; then
+	pass "operator image: 429 then a real failure on the retry -> generic reason, not rate-limited"
+else
+	bad "operator image 429 then other (rc $orc)"
+	cat "$o/out" "$o/state/setup-error.txt"
+fi
+opimg nobase 0 "" FAKE_NO_BASE=1
+if ((orc == 2)) && grep -q "could not read the operator base image digest" "$o/state/setup-error.txt"; then pass "operator image: no resolved base digest in the log -> setup-error"; else bad "operator image no base (rc $orc)"; cat "$o/out"; fi
 opimg other 1 "some compile error"
 if ((orc == 2)) && [[ $(cat "$o/fd/make.n") == 1 ]] && grep -qx "make operator-image failed (see collect/build-operator-image.log in the artifact)" "$o/state/setup-error.txt"; then
 	pass "operator image: other make failure -> setup-error, no retry"

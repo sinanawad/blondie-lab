@@ -35,19 +35,28 @@ command -v gh >/dev/null || setup_fail "trust check could not complete (gh not f
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# One deadline for the whole check, below the step's 3 min timeout, so a slow
+# API ends with this script's own reason, not a generic step timeout (ref +
+# tests_ref is up to 11 calls). Each call gets at most 20 s of what is left.
+deadline=${LAB_TRUST_DEADLINE_S:-150}
+[[ $deadline =~ ^[1-9][0-9]*$ ]] || setup_fail "ref-trust: LAB_TRUST_DEADLINE_S: unexpected value"
+
 # api <what> <gh api args...>: stdout of a successful call in $tmp/body.
 # Returns 0 on success, 1 on HTTP 404/422 (no such commit/file/ref); any
 # other failure ends the script: trust check could not complete.
 api() {
-	local what=$1 rc=0
+	local what=$1 rc=0 left t
 	shift
-	timeout 30 gh api "$@" >"$tmp/body" 2>"$tmp/err" || rc=$?
+	left=$((deadline - SECONDS))
+	((left > 0)) || setup_fail "trust check could not complete ($what: ${deadline}s deadline reached)"
+	t=$((left < 20 ? left : 20))
+	timeout "$t" gh api "$@" >"$tmp/body" 2>"$tmp/err" || rc=$?
 	((rc == 0)) && return 0
 	if ((rc != 124)) && grep -qE '\(HTTP (404|422)\)' "$tmp/err"; then
 		return 1
 	fi
 	local why
-	if ((rc == 124)); then why="timed out after 30s"; else why=$(head -c 200 "$tmp/err" | tr -d '\r\n'); fi
+	if ((rc == 124)); then why="timed out after ${t}s"; else why=$(head -c 200 "$tmp/err" | tr -d '\r\n'); fi
 	setup_fail "trust check could not complete ($what: $why)"
 }
 

@@ -6,7 +6,7 @@
 #
 # Steps: validate -> [ref trust check, for ref/tests_ref] -> [free disk, build
 # mode] -> [substrate (LXD or MicroK8s) + juju snap (snap mode) or juju source
-# checkout + Go + module cache + build (build mode) + tests checkout + deps +
+# checkout + Go + build (build mode) + tests checkout + deps +
 # bootstrap, for NEEDS_JUJU=1] -> ready -> scenario -> collect -> scrub ->
 # verdict -> upload (full, or minimal when scrub blocks/fails) -> teardown ->
 # job result. On k8s, every step that talks to MicroK8s or the controller runs
@@ -53,8 +53,9 @@ jobs:
   lab:
     name: lab
     runs-on: ubuntu-24.04
-    # Backstop only (design §2); every step has its own timeout.
-    timeout-minutes: 260
+    # Backstop only (design §2); every step has its own timeout, and their
+    # worst-case sum must fit here (test-harness.sh checks).
+    timeout-minutes: 300
     permissions:
       contents: read
     env:
@@ -64,6 +65,7 @@ jobs:
       LAB_CLOUD: ${{ inputs.substrate == 'k8s' && 'microk8s' || 'localhost' }}
     steps:
       - name: Checkout blondie-lab
+        timeout-minutes: 2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -102,7 +104,7 @@ jobs:
       # Build mode needs the room (design §2 "Disk"); df -h goes to the artifact.
       - name: Free disk (build mode)
         id: freedisk
-        if: steps.validate.outputs.source == 'build'
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
         timeout-minutes: 5
         env:
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
@@ -176,7 +178,7 @@ jobs:
       # --- Build mode (design §3). Only reached after the trust check passed. ---
       - name: Checkout juju/juju at ref_sha (build mode)
         id: src_checkout
-        if: steps.validate.outputs.source == 'build'
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
         timeout-minutes: 5
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,30 +189,20 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # cache: false: setup-go's own cache saves module + build cache (GBs)
-      # per go.sum; only GOMODCACHE is cached, below (design §3).
+      # cache: false: no Go caches in v1 (owner decision 2026-10-16, design
+      # §3); every build downloads its modules (go mod download, timed).
       - name: Set up Go (build mode)
         id: go
-        if: steps.validate.outputs.source == 'build'
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
         timeout-minutes: 5
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: juju-src/go.mod
           cache: false
 
-      - name: Restore Go module cache (build mode)
-        id: gomod_restore
-        if: steps.validate.outputs.source == 'build'
-        timeout-minutes: 5
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/go/pkg/mod
-          key: gomod-${{ steps.trust.outputs.ref_line }}-${{ hashFiles('juju-src/go.sum') }}
-          restore-keys: gomod-${{ steps.trust.outputs.ref_line }}-
-
       - name: Build juju (build mode)
         id: build
-        if: steps.validate.outputs.source == 'build'
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
         timeout-minutes: 45
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
@@ -218,17 +210,6 @@ jobs:
           LAB_SRC: ${{ github.workspace }}/juju-src
           LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
         run: scripts/build-juju.sh
-
-      # Saved only from runs dispatched on main (PR-branch entries are
-      # branch-scoped and unreadable from main) and only without an exact hit.
-      - name: Save Go module cache (build mode, main only)
-        id: gomod_save
-        if: steps.validate.outputs.source == 'build' && github.ref == 'refs/heads/main' && steps.gomod_restore.outputs.cache-hit != 'true'
-        timeout-minutes: 5
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/go/pkg/mod
-          key: gomod-${{ steps.trust.outputs.ref_line }}-${{ hashFiles('juju-src/go.sum') }}
 
       - name: Resolve tests ref
         id: tests
@@ -313,8 +294,8 @@ jobs:
           OUTCOMES: >-
             trust=${{ steps.trust.outcome }} freedisk=${{ steps.freedisk.outcome }}
             lxd=${{ steps.lxd.outcome }} lxdwait=${{ steps.lxdwait.outcome }} microk8s=${{ steps.microk8s.outcome }} juju=${{ steps.juju.outcome }}
-            src_checkout=${{ steps.src_checkout.outcome }} go=${{ steps.go.outcome }} gomod_restore=${{ steps.gomod_restore.outcome }}
-            build=${{ steps.build.outcome }} gomod_save=${{ steps.gomod_save.outcome }}
+            src_checkout=${{ steps.src_checkout.outcome }} go=${{ steps.go.outcome }}
+            build=${{ steps.build.outcome }}
             tests=${{ steps.tests.outcome }} tests_checkout=${{ steps.tests_checkout.outcome }}
             deps=${{ steps.deps.outcome }} bootstrap=${{ steps.bootstrap.outcome }} bootstrap_build=${{ steps.bootstrap_build.outcome }}
         run: |
@@ -396,9 +377,6 @@ jobs:
           VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
           READY_OUTCOME: ${{ steps.ready.outcome }}
           SCENARIO_OUTCOME: ${{ steps.scenario.outcome }}
-          # cache-hit is empty on a miss; reported as false when the restore ran.
-          BUILD_CACHE_HIT: ${{ steps.gomod_restore.outcome == 'success' && (steps.gomod_restore.outputs.cache-hit || 'false') || '' }}
-          BUILD_CACHE_KEY: ${{ steps.gomod_restore.outputs.cache-matched-key }}
         run: scripts/verdict.sh
 
       # Full upload (the scrubbed snapshot, never the live dir) only when scrub
