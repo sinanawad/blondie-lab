@@ -178,7 +178,7 @@ jobs:
           LAB_JUJU_SOURCE: snap
           # bootstrap.sh's own limit; with preflight 60 s + dump 155 s +
           # post-bootstrap 60 s it must fit timeout-minutes (test-harness.sh checks).
-          LAB_BOOTSTRAP_TIMEOUT: "5" # TEMPORARY DRILL (bootstrap-hang): removed before review
+          LAB_BOOTSTRAP_TIMEOUT: "900"
         run: |
           if [ "$LAB_SUBSTRATE" = k8s ]; then
             exec sg snap_microk8s -c "$GITHUB_WORKSPACE/scripts/bootstrap.sh"
