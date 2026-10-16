@@ -13,4 +13,16 @@ args=("${cloud_args[@]}")
 rc=0
 "$LAB_ROOT/scripts/suite.sh" "${args[@]}" "$suite" || rc=$?
 ((rc == 0)) || exit "$rc"
+# The suite's known leftovers (leftovers.txt) are destroyed here, by name.
+# Anything else still left is a leak, and no-models-left.sh fails it.
+pids=()
+while read -r m; do
+	[[ -z $m || $m == \#* ]] && continue
+	if timeout 30 juju show-model "$LAB_CONTROLLER:admin/$m" >/dev/null 2>&1; then
+		echo "secrets-k8s: destroying known leftover admin/$m"
+		timeout 600 juju destroy-model --no-prompt --destroy-storage "$LAB_CONTROLLER:admin/$m" &
+		pids+=($!)
+	fi
+done <"$here/leftovers.txt"
+for p in "${pids[@]}"; do wait "$p" || echo "secrets-k8s: destroy-model exited $? (no-models-left.sh decides)"; done
 exec "$LAB_ROOT/scripts/no-models-left.sh" secrets-k8s 600
