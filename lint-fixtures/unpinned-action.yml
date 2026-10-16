@@ -1,0 +1,13 @@
+# FIXTURE: must fail zizmor (unpinned-uses, hash-pin policy). Never move into .github/workflows.
+name: fixture-unpinned-action
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  bad:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false

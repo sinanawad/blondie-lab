@@ -1,0 +1,106 @@
+# Dispatch: run a scenario against Juju on LXD (machine charms).
+# PR-1 STUB: full v1 input schema plus a validate-and-echo job, so that later
+# PRs can be dispatched from their branches (GitHub only accepts
+# workflow_dispatch for a workflow that exists on the default branch).
+# PR-2 replaces the job with a call to ./.github/workflows/_run.yml.
+# Inputs reach the shell only through env:, never as ${{ inputs.* }} in run:.
+name: lab-lxd
+run-name: ${{ inputs.scenario }} ${{ inputs.ref || inputs.juju_channel }} [${{ inputs.request_id }}]
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Folder under scenarios/ to run"
+        required: true
+        type: string
+      juju_channel:
+        description: "Juju snap channel (snap mode), e.g. 4.0/stable"
+        required: false
+        type: string
+        default: "4.0/stable"
+      ref:
+        description: "Optional juju/juju tag or SHA; switches to build mode"
+        required: false
+        type: string
+        default: ""
+      tests_ref:
+        description: "Optional juju/juju tag or SHA for tests/ (default derived)"
+        required: false
+        type: string
+        default: ""
+      repeat:
+        description: "Iterations, 1-10"
+        required: false
+        type: string
+        default: "1"
+      request_id:
+        description: "Caller nonce for run lookup ([A-Za-z0-9-], max 64)"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  # Per workflow. With cancel-in-progress: false a duplicate dispatch with the same
+  # request_id waits for the first one (serialised, not de-duplicated).
+  group: ${{ github.workflow }}-${{ inputs.request_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: validate (stub)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Validate inputs
+        env:
+          LAB_SUBSTRATE: lxd
+          IN_SCENARIO: ${{ inputs.scenario }}
+          IN_JUJU_CHANNEL: ${{ inputs.juju_channel }}
+          IN_REF: ${{ inputs.ref }}
+          IN_TESTS_REF: ${{ inputs.tests_ref }}
+          IN_REPEAT: ${{ inputs.repeat }}
+          IN_REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          err() { echo "::error::$*"; exit 2; }
+          re_scenario='^[a-z0-9][a-z0-9-]{0,63}$'
+          re_ref='^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$'
+          re_channel='^(latest|[0-9]+\.[0-9]+)/(stable|candidate|beta|edge)$'
+          re_request_id='^[A-Za-z0-9-]{1,64}$'
+          [[ $IN_SCENARIO =~ $re_scenario ]] || err "scenario: must match $re_scenario"
+          [[ $IN_JUJU_CHANNEL =~ $re_channel ]] || err "juju_channel: must match $re_channel"
+          check_ref() {
+            local name=$1 v=$2
+            [[ -z $v ]] && return 0
+            [[ $v =~ $re_ref ]] || err "$name: must match $re_ref"
+            # git check-ref-format rules not covered by the regex ('@' is outside its
+            # character set, so '@{' can't occur): no refs/ prefix, no '..' or '//',
+            # no path component starting with '.' or ending in '.lock', no trailing '/' or '.'.
+            case $v in
+              refs/* | *..* | *//* | */.* | *.lock | *.lock/* | */ | *.) err "$name: refs/ prefix, '..', '//', a component starting with '.' or ending in '.lock', or a trailing '/' or '.' is not allowed" ;;
+            esac
+          }
+          check_ref ref "$IN_REF"
+          check_ref tests_ref "$IN_TESTS_REF"
+          [[ $IN_REPEAT =~ ^([1-9]|10)$ ]] || err "repeat: integer 1..10"
+          if [[ -n $IN_REQUEST_ID ]]; then
+            [[ $IN_REQUEST_ID =~ $re_request_id ]] || err "request_id: must match $re_request_id"
+          fi
+          {
+            echo "### lab stub: inputs valid (no Juju run)"
+            echo
+            echo "| input | value |"
+            echo "|---|---|"
+            echo "| substrate | $LAB_SUBSTRATE |"
+            echo "| scenario | $IN_SCENARIO |"
+            echo "| juju_channel | $IN_JUJU_CHANNEL |"
+            echo "| ref | ${IN_REF:-(none)} |"
+            echo "| tests_ref | ${IN_TESTS_REF:-(derived)} |"
+            echo "| repeat | $IN_REPEAT |"
+            echo "| request_id | ${IN_REQUEST_ID:-(none)} |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

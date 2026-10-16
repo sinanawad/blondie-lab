@@ -1,0 +1,80 @@
+# Lint for blondie-lab. Single job named `lint` (the ruleset's required check).
+# No live Juju here. Fork PRs fail closed in the first step, before checkout, so fork
+# code never runs and a fork PR can't show a green `lint` (a job skipped by a
+# job-level `if:` reports Success, which satisfies a required check).
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: lint-${{ github.ref }}
+  # Cancel superseded runs on PR branches only; every push to main keeps its own lint result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+      # sha256 of actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksums.txt
+      ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+    steps:
+      - name: Refuse fork PRs (fail closed, before checkout)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::fork PRs are not linted here; push the branch to this repository instead"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (pinned, checksum-verified)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+
+      - name: Install zizmor (venv, hash-pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/lint-venv"
+          "$RUNNER_TEMP/lint-venv/bin/pip" install --quiet --require-hashes --only-binary :all: -r lint-requirements.txt
+          "$RUNNER_TEMP/lint-venv/bin/zizmor" --version
+
+      - name: actionlint (workflows)
+        run: '"$RUNNER_TEMP/actionlint" -color'
+
+      - name: zizmor (workflows, online audits)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/lint-venv/bin/zizmor" --config zizmor.yml --min-severity low .github/workflows'
+
+      - name: shellcheck (scripts and scenarios)
+        run: |
+          set -euo pipefail
+          test -d scripts || { echo "::error::scripts/ is missing"; exit 1; }
+          # Tracked files under scripts/ and scenarios/ with a sh/bash/dash shebang,
+          # whatever their extension (e.g. scripts/lab-kubectl).
+          mapfile -t files < <(git ls-files -z scripts scenarios | xargs -0 -r grep -lE '^#!.*\b(ba|da)?sh\b' | sort)
+          if [ "${#files[@]}" -eq 0 ]; then echo "::error::no shell scripts found under scripts/"; exit 1; fi
+          printf '%s\n' "${files[@]}"
+          shellcheck -x "${files[@]}"
+
+      - name: Linters still fail on lint-fixtures/
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ACTIONLINT="$RUNNER_TEMP/actionlint" ZIZMOR="$RUNNER_TEMP/lint-venv/bin/zizmor" \
+            scripts/check-lint-fixtures.sh

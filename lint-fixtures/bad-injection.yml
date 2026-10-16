@@ -1,0 +1,11 @@
+# FIXTURE: must fail zizmor (template-injection). Never move into .github/workflows.
+name: fixture-bad-injection
+on:
+  pull_request:
+permissions: {}
+jobs:
+  bad:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - run: echo "${{ github.event.pull_request.title }}"
