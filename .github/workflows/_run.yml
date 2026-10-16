@@ -4,14 +4,18 @@
 # only narrow what the calling job grants (contents: read).
 # Inputs reach the shell only through env:, never as ${{ inputs.* }} in run:.
 #
-# Steps: validate -> [substrate (LXD or MicroK8s) + juju snap + tests checkout +
-# deps + bootstrap, for NEEDS_JUJU=1] -> ready -> scenario -> collect -> scrub ->
+# Steps: validate -> [ref trust check, for ref/tests_ref] -> [free disk, build
+# mode] -> [substrate (LXD or MicroK8s) + juju snap (snap mode) or juju source
+# checkout + Go + build (build mode) + tests checkout + deps +
+# bootstrap, for NEEDS_JUJU=1] -> ready -> scenario -> collect -> scrub ->
 # verdict -> upload (full, or minimal when scrub blocks/fails) -> teardown ->
 # job result. On k8s, every step that talks to MicroK8s or the controller runs
 # under `sg snap_microk8s -c <fixed string>` (design §4; the group is added
 # mid-job, so only a new group session sees it).
-# Not implemented yet (validate.sh rejects as setup-error): ref build mode and
-# an explicit tests_ref (PR-5, trust check).
+# Build mode (ref set; design §3): juju/juju at the trusted ref_sha is built
+# with `make go-install` (and on k8s the operator image is imported into
+# MicroK8s); $(go env GOPATH)/bin is first on PATH and no juju snap is
+# installed; bootstrap.sh asserts the binary and the agent identity.
 name: _run
 
 on:
@@ -49,8 +53,9 @@ jobs:
   lab:
     name: lab
     runs-on: ubuntu-24.04
-    # Backstop only (design §2); every step has its own timeout.
-    timeout-minutes: 260
+    # Backstop only (design §2); every step has its own timeout, and their
+    # worst-case sum must fit here (test-harness.sh checks).
+    timeout-minutes: 300
     permissions:
       contents: read
     env:
@@ -60,6 +65,7 @@ jobs:
       LAB_CLOUD: ${{ inputs.substrate == 'k8s' && 'microk8s' || 'localhost' }}
     steps:
       - name: Checkout blondie-lab
+        timeout-minutes: 2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -81,6 +87,41 @@ jobs:
           LAB_IN_REPEAT: ${{ inputs.repeat }}
           LAB_IN_REQUEST_ID: ${{ inputs.request_id }}
         run: scripts/validate.sh
+
+      # Design §8 (Q8): resolve ref/tests_ref to SHAs and check them against
+      # juju/juju before any setup; fails closed on any API error.
+      - name: Ref trust check
+        id: trust
+        if: steps.validate.outputs.trust == '1'
+        timeout-minutes: 3
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          GH_TOKEN: ${{ github.token }}
+          LAB_REF: ${{ steps.validate.outputs.ref }}
+          LAB_TESTS_REF: ${{ steps.validate.outputs.tests_ref }}
+        run: scripts/ref-trust.sh
+
+      # Build mode needs the room (design §2 "Disk"); df -h goes to the artifact.
+      - name: Free disk (build mode)
+        id: freedisk
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
+        timeout-minutes: 5
+        env:
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+        run: |
+          mkdir -p "$LAB_ARTIFACT_DIR/collect"
+          df -h | tee "$LAB_ARTIFACT_DIR/collect/df-before-free.txt"
+          # A build plus bootstrap uses ~15G (calibration: docs/calibration.md);
+          # hosted runners start with ~86G free, and freeing takes 50-290s.
+          # Only free space when the runner is actually short of it.
+          avail_gb=$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')
+          if [ "${avail_gb:-0}" -ge 30 ]; then
+            echo "root has ${avail_gb}G free (>= 30G): skipping cleanup"
+            exit 0
+          fi
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force >/dev/null || echo "docker image prune failed (continuing)"
+          df -h | tee "$LAB_ARTIFACT_DIR/collect/df-after-free.txt"
 
       # --- Setup (NEEDS_JUJU=1 only). Every failure here is setup-error. ---
       - name: Set up LXD
@@ -127,12 +168,48 @@ jobs:
 
       - name: Install juju snap
         id: juju
-        if: steps.validate.outputs.needs_juju == '1'
+        if: steps.validate.outputs.needs_juju == '1' && steps.validate.outputs.source == 'snap'
         timeout-minutes: 5
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           LAB_JUJU_CHANNEL: ${{ steps.validate.outputs.juju_channel }}
         run: scripts/setup-juju.sh
+
+      # --- Build mode (design §3). Only reached after the trust check passed. ---
+      - name: Checkout juju/juju at ref_sha (build mode)
+        id: src_checkout
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: juju/juju
+          ref: ${{ steps.trust.outputs.ref_sha }}
+          path: juju-src
+          # .git is kept (GIT_COMMIT for the build and for --build-agent).
+          fetch-depth: 1
+          persist-credentials: false
+
+      # cache: false: no Go caches in v1 (owner decision 2026-10-16, design
+      # §3); every build downloads its modules (go mod download, timed).
+      - name: Set up Go (build mode)
+        id: go
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
+        timeout-minutes: 5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: juju-src/go.mod
+          cache: false
+
+      - name: Build juju (build mode)
+        id: build
+        if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
+        timeout-minutes: 45
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_SRC: ${{ github.workspace }}/juju-src
+          LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
+        run: scripts/build-juju.sh
 
       - name: Resolve tests ref
         id: tests
@@ -141,11 +218,15 @@ jobs:
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           GH_TOKEN: ${{ github.token }}
+          LAB_JUJU_SOURCE: ${{ steps.validate.outputs.source }}
+          LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
+          LAB_TESTS_REF_SHA: ${{ steps.trust.outputs.tests_ref_sha }}
         run: scripts/resolve-tests.sh
 
+      # Snap mode or an explicit tests_ref; build mode otherwise uses juju-src/tests.
       - name: Checkout juju/juju tests
         id: tests_checkout
-        if: steps.validate.outputs.needs_tests == '1'
+        if: steps.validate.outputs.needs_tests == '1' && steps.tests.outputs.tests_checkout == '1'
         timeout-minutes: 5
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -166,16 +247,19 @@ jobs:
           LAB_NEEDS_TESTS: ${{ steps.validate.outputs.needs_tests }}
         run: scripts/deps.sh
 
+      # Snap mode, and k8s build mode (--agent-version, the image is prebuilt).
       - name: Bootstrap
         id: bootstrap
-        if: steps.validate.outputs.needs_juju == '1'
+        if: steps.validate.outputs.needs_juju == '1' && !(steps.validate.outputs.source == 'build' && inputs.substrate == 'lxd')
         timeout-minutes: 20
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
           # Copied from juju/juju smoke.yml (design §3).
           BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
-          LAB_JUJU_SOURCE: snap
+          LAB_JUJU_SOURCE: ${{ steps.validate.outputs.source }}
+          LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
+          LAB_SRC: ${{ github.workspace }}/juju-src
           # bootstrap.sh's own limit; with preflight 60 s + dump 155 s +
           # post-bootstrap 60 s it must fit timeout-minutes (test-harness.sh checks).
           LAB_BOOTSTRAP_TIMEOUT: "900"
@@ -185,6 +269,22 @@ jobs:
           fi
           exec scripts/bootstrap.sh
 
+      # LXD build mode: --build-agent rebuilds the agent inside bootstrap
+      # (design §2: 30 min step), so bootstrap.sh gets a longer own limit.
+      - name: Bootstrap (LXD build mode)
+        id: bootstrap_build
+        if: steps.validate.outputs.source == 'build' && inputs.substrate == 'lxd'
+        timeout-minutes: 30
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
+          LAB_JUJU_SOURCE: build
+          LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
+          LAB_SRC: ${{ github.workspace }}/juju-src
+          LAB_BOOTSTRAP_TIMEOUT: "1500"
+        run: exec scripts/bootstrap.sh
+
       # Names the failed setup step when the step itself couldn't (actions).
       - name: Record setup failure
         if: failure() && steps.validate.outcome == 'success'
@@ -192,9 +292,12 @@ jobs:
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           OUTCOMES: >-
+            trust=${{ steps.trust.outcome }} freedisk=${{ steps.freedisk.outcome }}
             lxd=${{ steps.lxd.outcome }} lxdwait=${{ steps.lxdwait.outcome }} microk8s=${{ steps.microk8s.outcome }} juju=${{ steps.juju.outcome }}
+            src_checkout=${{ steps.src_checkout.outcome }} go=${{ steps.go.outcome }}
+            build=${{ steps.build.outcome }}
             tests=${{ steps.tests.outcome }} tests_checkout=${{ steps.tests_checkout.outcome }}
-            deps=${{ steps.deps.outcome }} bootstrap=${{ steps.bootstrap.outcome }}
+            deps=${{ steps.deps.outcome }} bootstrap=${{ steps.bootstrap.outcome }} bootstrap_build=${{ steps.bootstrap_build.outcome }}
         run: |
           mkdir -p "$LAB_STATE_DIR"
           if [ ! -s "$LAB_STATE_DIR/setup-error.txt" ]; then
@@ -222,12 +325,12 @@ jobs:
           LAB_REPEAT: ${{ steps.validate.outputs.repeat }}
           LAB_TIMEOUT_MIN: ${{ steps.validate.outputs.timeout_min }}
           LAB_NEEDS_JUJU: ${{ steps.validate.outputs.needs_juju }}
-          LAB_JUJU_SOURCE: snap
-          LAB_JUJU_VERSION: ${{ steps.juju.outputs.juju_version }}
-          LAB_JUJU_GIT_COMMIT: ${{ steps.juju.outputs.juju_git_commit }}
-          LAB_REF: ""
-          LAB_REF_SHA: ""
-          LAB_TESTS_DIR: ${{ steps.validate.outputs.needs_tests == '1' && format('{0}/juju-tests/tests', github.workspace) || '' }}
+          LAB_JUJU_SOURCE: ${{ steps.validate.outputs.source }}
+          LAB_JUJU_VERSION: ${{ steps.juju.outputs.juju_version || steps.build.outputs.juju_version }}
+          LAB_JUJU_GIT_COMMIT: ${{ steps.juju.outputs.juju_git_commit || steps.build.outputs.juju_git_commit }}
+          LAB_REF: ${{ steps.validate.outputs.ref }}
+          LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
+          LAB_TESTS_DIR: ${{ steps.validate.outputs.needs_tests == '1' && format('{0}/{1}/tests', github.workspace, steps.tests.outputs.tests_checkout == '1' && 'juju-tests' || 'juju-src') || '' }}
           LAB_TESTS_SHA: ${{ steps.tests.outputs.tests_sha }}
           BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
         run: |

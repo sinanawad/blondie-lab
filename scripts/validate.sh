@@ -121,11 +121,8 @@ if [[ $NEEDS_JUJU == 0 ]]; then
 	[[ $NEEDS_TESTS == 0 && -z $DEPS ]] || fail "scenario.env: NEEDS_JUJU=0 excludes NEEDS_TESTS=1 and DEPS"
 else
 	[[ $NEEDS_TESTS == 1 || -z $tests_ref ]] || fail "tests_ref: not used by scenario $scenario (NEEDS_TESTS=0)"
-	# Not implemented yet: these fail as setup-error rather than doing something partial.
-	[[ -z $ref ]] || fail "ref: build mode is not implemented yet (plan PR-5)"
-	# An explicit tests_ref runs code from that ref in the job, so it needs the
-	# ref trust check (design §8), which lands with build mode.
-	[[ -z $tests_ref ]] || fail "tests_ref: an explicit tests_ref needs the ref trust check (plan PR-5); omit it to use the snap's git-commit"
+	# ref (build mode) and an explicit tests_ref are checked against juju/juju
+	# by scripts/ref-trust.sh in the next step, before any setup (design §8).
 	# DEPS words must be in the vocabulary deps.sh installs from (fail in seconds,
 	# not after the LXD and juju setup).
 	for d in $DEPS; do
@@ -134,7 +131,19 @@ else
 	done
 fi
 
+# Build mode when ref is set (design §3); juju_channel is then unused (it
+# always has a default, so it can't be "explicitly" given) and reported null.
+source=snap
+[[ -n $ref ]] && source=build
+[[ $NEEDS_JUJU == 1 ]] || source=none
+ok source "$source"
+trust=0
+[[ -n $ref || -n $tests_ref ]] && trust=1
 {
+	echo "source=$source"
+	echo "trust=$trust"
+	echo "ref=$ref"
+	echo "tests_ref=$tests_ref"
 	echo "scenario=$scenario"
 	echo "repeat=$repeat"
 	echo "scenario_timeout=$scenario_timeout"
@@ -144,4 +153,4 @@ fi
 	echo "deps=$DEPS"
 	echo "juju_channel=$channel"
 } >>"$OUT"
-echo "validate: ok (scenario=$scenario substrate=$substrate repeat=$repeat TIMEOUT_MIN=$TIMEOUT_MIN scenario_timeout=$scenario_timeout)"
+echo "validate: ok (scenario=$scenario substrate=$substrate source=$source repeat=$repeat TIMEOUT_MIN=$TIMEOUT_MIN scenario_timeout=$scenario_timeout)"
