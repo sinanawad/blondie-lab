@@ -11,7 +11,7 @@
   - `test_credential_get_k8s`
   - `test_rootless` (run_non_root_charm, run_sudoer_charm)
 
-- **Deps:** `DEPS=charmcraft` (4.x/stable). `test_rootless` packs `sidecar-non-root` and `sidecar-sudoer` from `testcharms/` and checks for charmcraft first. Without it the run is a `setup-error` ("Missing dependencies: charmcraft", run 38907759017).
+- **Deps:** `DEPS=charmcraft` (4.x/stable). `test_rootless` packs `sidecar-non-root` and `sidecar-sudoer` from `testcharms/` and checks for charmcraft first. Without it the run is a `setup-error` ("Missing dependencies: charmcraft", run 38907759017). charmcraft packs in an LXD instance, so on this k8s runner the harness also sets up LXD when `DEPS` has charmcraft (#8; before that fix, run 38910641303 failed).
 - **Note:** no skips. k8s only (the suite skips itself on non-k8s providers). Only `test_rootless` uses `run`, so the `] Success:` lines come from it. The other tests deploy sidecar charms from CharmHub directly.
 - **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name.
 - **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
