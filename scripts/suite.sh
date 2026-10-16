@@ -30,6 +30,12 @@ out=$(mktemp)
 trap 'rm -f "$out"' EXIT
 cd "$LAB_TESTS_DIR"
 rm -rf tmp.*
+# Suites hand mktemp files to juju (model-config --file); the strictly confined
+# juju snap has a private /tmp and can't open the runner's /tmp/tmp.* ("ERROR
+# open /tmp/tmp.X: no such file", cli). Keep TMPDIR inside the tests checkout
+# (a non-hidden path under $HOME, readable through the snap's home interface).
+rm -rf lab-tmp && mkdir lab-tmp
+export TMPDIR="$LAB_TESTS_DIR/lab-tmp"
 rc=0
 # BOOTSTRAP_BASE stays unset so bootstrap() reuses the controller (design §4).
 env -u BOOTSTRAP_BASE ./main.sh -l "$LAB_CONTROLLER" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
