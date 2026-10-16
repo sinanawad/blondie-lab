@@ -644,7 +644,7 @@ cat >"$fb/juju" <<'FAKE'
 #!/usr/bin/env bash
 case $1 in
 clouds) echo '{"microk8s":{"type":"k8s"}}' ;;
-bootstrap) [[ -n ${FAKE_BOOT_OK:-} ]] && exit 0; echo "$$" >"$FAKE_PID"; exec sleep 60 ;;
+bootstrap) [[ -n ${FAKE_BOOT_OK:-} ]] && { echo "$*" >>"${FAKE_BOOT_ARGS:-/dev/null}"; exit 0; }; echo "$$" >"$FAKE_PID"; exec sleep 60 ;;
 switch) exit 0 ;;
 show-controller) echo '{"lab":{"details":{"agent-version":"4.0.15"}}}' ;;
 esac
@@ -696,7 +696,7 @@ boot_ok() {
 	env -i PATH="$fb:$fk:$PATH" HOME="$tmp" LAB_CONTROLLER=lab LAB_CLOUD=microk8s LAB_ARTIFACT_DIR="$b" LAB_STATE_DIR="$b.state" \
 		FAKE_BOOT_OK=1 FAKE_LOG="$tmp/fake.log" FAKE_NS_DIR="$nsd" "$@" bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
 }
-boot_ok snapok LAB_JUJU_SOURCE=snap
+boot_ok snapok LAB_JUJU_SOURCE=snap FAKE_BOOT_ARGS="$tmp/boot-args"
 if ((brc == 0)) && grep -qx agent_source=packaged "$b.state/juju.env" &&
 	jq -e 'length == 3 and (map(.name) == ["charm-init", "charm", "api-server"]) and .[2].imageID == "ghcr.io/juju/jujud-operator@sha256:aa"' \
 		<<<"$(sed -n 's/^controller_images=//p' "$b.state/juju.env")" >/dev/null; then
@@ -705,6 +705,7 @@ else
 	bad "bootstrap k8s images (rc $brc)"
 	cat "$b.out" "$b.state/juju.env"
 fi
+if grep -q -- '--model-default mode=' "$tmp/boot-args"; then pass "bootstrap: --model-default mode= (no confirmation prompts, as juju/juju tests)"; else bad "bootstrap without mode="; cat "$tmp/boot-args"; fi
 boot_ok otherimg LAB_JUJU_SOURCE=snap FAKE_API_IMAGE=example.com/x/jujud-operator:4.0.15
 if ((brc == 0)) && grep -qx agent_source=unknown "$b.state/juju.env"; then pass "bootstrap k8s: other image repo -> agent_source unknown"; else bad "bootstrap k8s other repo (rc $brc)"; cat "$b.out"; fi
 boot_ok snapnoplug LAB_JUJU_SOURCE=snap FAKE_NO_SNAP=1
@@ -953,7 +954,7 @@ boot_build() {
 }
 bline='Building local Juju agent binary version <nil> for amd64'
 boot_build lxdok localhost FAKE_AGENT=4.0.14.1 "FAKE_BOOT_OUT=$bline"
-if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$tmp/jsrc bootstrap localhost lab --debug --build-agent" "$tmp/bb.log"; then
+if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$tmp/jsrc bootstrap localhost lab --debug --build-agent --model-default mode=" "$tmp/bb.log"; then
 	pass "bootstrap build LXD: --build-agent from LAB_SRC, agent 4.0.14.1 + build line -> local"
 else
 	bad "bootstrap build LXD ok (rc $brc)"
@@ -1000,7 +1001,7 @@ else
 	cat "$b.out"
 fi
 boot_build k8sok microk8s FAKE_AGENT=4.0.14 FAKE_API_IMAGE=ghcr.io/juju/jujud-operator:4.0.14 FAKE_API_ID="$cfg"
-if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$PWD bootstrap microk8s lab --debug --agent-version=4.0.14" "$tmp/bb.log" &&
+if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$PWD bootstrap microk8s lab --debug --agent-version=4.0.14 --model-default mode=" "$tmp/bb.log" &&
 	! grep -q 'juju:peers' "$b.out"; then
 	pass "bootstrap build k8s: --agent-version, api-server imageID = imported config digest -> local"
 else
