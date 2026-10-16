@@ -1,0 +1,13 @@
+# FIXTURE: must fail actionlint (unknown key, bad expression). Never move into .github/workflows.
+name: fixture-actionlint-bad
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  bad:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout_minutes: 5
+    steps:
+      - if: ${{ github.event.inputs.x.y.z() }}
+        run: echo hello
