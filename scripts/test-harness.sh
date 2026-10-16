@@ -413,6 +413,12 @@ fake_tests leftover 1 '==> TEST BEGIN: smoke' "$SIG_DUP" '    juju switch lab'
 # After the marker: the sentence unprefixed (as main.sh -v streams a test log) and prefixed (RUN OUTPUT).
 fake_tests intest 1 '==> TEST BEGIN: labdrill' '===> [   ] Running: labdrill dup' "$SIG_DUP" 'Missing dependencies: jq' '==> RUN OUTPUT: test_labdrill' "    | $SIG_DUP" 'ERROR model "x" already exists'
 fake_tests plainfail 1 '==> TEST BEGIN: smoke' 'something failed'
+# sidecar-style suites: no run() marker, one ensure per test. The first
+# ensure's leftover is setup (infra); after the second "Reusing bootstrapped
+# juju" it is the previous test's teardown (fail).
+fake_tests reuse1 1 '==> TEST BEGIN: sidecar' '====> Reusing bootstrapped juju (4.0.15:microk8s)' "$SIG_DUP"
+fake_tests reuse2 1 '==> TEST BEGIN: sidecar' '====> Reusing bootstrapped juju (4.0.15:microk8s)' 'Deployed "snappass-test"' \
+	'====> Reusing bootstrapped juju (4.0.15:microk8s)' "$SIG_DUP" '    juju switch lab'
 fake_tests ok 0 '===> [   ] Running: charmhub deploy' $'\r\e[1A\e[0K===> [ \xe2\x9c\x94 ] Success: charmhub deploy (1s)'
 # Exit-code normalisation (Blocker): main.sh passes through whatever failed.
 fake_tests noneran 0 '==> TEST BEGIN: smoke' '==> TEST SKIPPED: smoke deploy tests'
@@ -462,6 +468,8 @@ suite_case depmiss 2 'Missing dependencies: yq'
 suite_case leftover 2 "$SIG_DUP"
 suite_case intest 1 ''
 suite_case plainfail 1 ''
+suite_case reuse1 2 "$SIG_DUP"
+suite_case reuse2 1 ''
 suite_case ok 0 ''
 suite_case noneran 3 ''
 suite_case rc2after 1 ''
@@ -1344,6 +1352,35 @@ if ((orc == 2)) && [[ $(cat "$o/fd/make.n") == 1 ]] && grep -qx "make operator-i
 else
 	bad "operator image other failure (rc $orc)"
 	cat "$o/out"
+fi
+
+# --- generated scenario READMEs match their inputs (gen-suite-readme.sh --check) -------
+# Every scenario with a skips.txt has a generated README; editing skips.txt,
+# alone.txt, notes.md or TIMEOUT_MIN without regenerating it fails lint.
+for f in scenarios/*/skips.txt; do
+	s=$(basename "$(dirname "$f")")
+	if out=$(bash scripts/gen-suite-readme.sh --check "$s" 2>&1); then
+		pass "README in sync: $s"
+	else
+		bad "README out of sync: $s (run scripts/gen-suite-readme.sh $s <juju tests dir>)"
+		echo "$out"
+	fi
+done
+# The check itself: a changed skip reason, an extra skip and a changed budget are caught.
+gr="$tmp/gen-readme"
+mkdir -p "$gr/scenarios"
+cp -r scenarios/hooks-dispatch "$gr/scenarios/"
+sed -i 's/design §5/design 5/' "$gr/scenarios/hooks-dispatch/skips.txt"
+echo 'test_new_one some reason' >>"$gr/scenarios/hooks-dispatch/skips.txt"
+sed -i 's/^TIMEOUT_MIN=.*/TIMEOUT_MIN=99/' "$gr/scenarios/hooks-dispatch/scenario.env"
+grc=0
+out=$(cd "$gr" && bash "$OLDPWD/scripts/gen-suite-readme.sh" --check hooks-dispatch 2>&1) || grc=$?
+if ((grc == 1)) && grep -q 'What line' <<<"$out" && grep -q 'reason for test_start_hook_fires_after_reboot' <<<"$out" &&
+	grep -q 'reason for test_new_one' <<<"$out" && grep -q 'Budget line' <<<"$out"; then
+	pass "gen-suite-readme --check: stale -s list, skip reason and budget -> exit 1"
+else
+	bad "gen-suite-readme --check negative (rc $grc)"
+	echo "$out"
 fi
 
 exit "$status"
