@@ -82,6 +82,11 @@ if [[ $cloud == microk8s ]]; then
 	timeout 30 juju clouds --client --format=json | jq -e '.microk8s.type == "k8s"' >/dev/null ||
 		setup_fail "juju does not list the built-in microk8s cloud"
 fi
+# As juju/juju tests' own bootstrap (includes/juju.sh): an empty model-default
+# `mode` turns off the confirmation prompts of remove-unit and friends, which
+# suites run non-interactively (relations: "Continue [y/N]? ERROR unit
+# removal: aborted").
+extra+=(--model-default mode=)
 # BOOTSTRAP_ADDITIONAL_ARGS is a fixed string from the workflow (copied from
 # juju/juju smoke.yml), split on purpose.
 # shellcheck disable=SC2086
