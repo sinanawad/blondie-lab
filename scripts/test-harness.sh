@@ -436,6 +436,28 @@ suite_case() {
 		cat "$tmp/log"
 	fi
 }
+# TMPDIR for the suite: inside the tests checkout, not /tmp (snap juju can't read /tmp).
+# This only asserts the value; it can't model the snap's private /tmp. The live
+# cli-basics run (cli model_config/model_defaults hand mktemp files to juju) is
+# the real test.
+td="$tmp/tests-tmpdir"
+mkdir -p "$td"
+cat >"$td/main.sh" <<'FAKE'
+#!/usr/bin/env bash
+echo "$TMPDIR" >"$TMPDIR_OUT"
+echo '===> [   ] Running: x'
+echo '===> [ ok ] Success: x'
+FAKE
+chmod +x "$td/main.sh"
+rc=0
+env -i PATH="$stub:$PATH" LAB_TESTS_DIR="$td" LAB_CONTROLLER=lab LAB_ARTIFACT_DIR="$tmp/art-tmpdir" LAB_ITERATION=1 TMPDIR_OUT="$tmp/tmpdir.out" \
+	bash scripts/suite.sh smoke >"$tmp/log" 2>&1 || rc=$?
+if ((rc == 0)) && [[ $(cat "$tmp/tmpdir.out") == "$td/lab-tmp" && -d $td/lab-tmp ]]; then
+	pass "suite.sh: TMPDIR is <tests>/lab-tmp (snap juju can read it), not /tmp"
+else
+	bad "suite.sh TMPDIR (rc $rc): $(cat "$tmp/tmpdir.out" 2>/dev/null)"
+	cat "$tmp/log"
+fi
 suite_case depmiss 2 'Missing dependencies: yq'
 suite_case leftover 2 "$SIG_DUP"
 suite_case intest 1 ''
@@ -646,7 +668,7 @@ cat >"$fb/juju" <<'FAKE'
 #!/usr/bin/env bash
 case $1 in
 clouds) echo '{"microk8s":{"type":"k8s"}}' ;;
-bootstrap) [[ -n ${FAKE_BOOT_OK:-} ]] && exit 0; echo "$$" >"$FAKE_PID"; exec sleep 60 ;;
+bootstrap) [[ -n ${FAKE_BOOT_OK:-} ]] && { echo "$*" >>"${FAKE_BOOT_ARGS:-/dev/null}"; exit 0; }; echo "$$" >"$FAKE_PID"; exec sleep 60 ;;
 switch) exit 0 ;;
 show-controller) echo '{"lab":{"details":{"agent-version":"4.0.15"}}}' ;;
 esac
@@ -698,7 +720,7 @@ boot_ok() {
 	env -i PATH="$fb:$fk:$PATH" HOME="$tmp" LAB_CONTROLLER=lab LAB_CLOUD=microk8s LAB_ARTIFACT_DIR="$b" LAB_STATE_DIR="$b.state" \
 		FAKE_BOOT_OK=1 FAKE_LOG="$tmp/fake.log" FAKE_NS_DIR="$nsd" "$@" bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
 }
-boot_ok snapok LAB_JUJU_SOURCE=snap
+boot_ok snapok LAB_JUJU_SOURCE=snap FAKE_BOOT_ARGS="$tmp/boot-args"
 if ((brc == 0)) && grep -qx agent_source=packaged "$b.state/juju.env" &&
 	jq -e 'length == 3 and (map(.name) == ["charm-init", "charm", "api-server"]) and .[2].imageID == "ghcr.io/juju/jujud-operator@sha256:aa"' \
 		<<<"$(sed -n 's/^controller_images=//p' "$b.state/juju.env")" >/dev/null; then
@@ -706,6 +728,12 @@ if ((brc == 0)) && grep -qx agent_source=packaged "$b.state/juju.env" &&
 else
 	bad "bootstrap k8s images (rc $brc)"
 	cat "$b.out" "$b.state/juju.env"
+fi
+if grep -q -- '--model-default mode=' "$tmp/boot-args" && grep -qx 'bootstrap_args=--model-default mode=' "$b.state/juju.env"; then
+	pass "bootstrap: --model-default mode= (no confirmation prompts, as juju/juju tests), recorded as bootstrap_args"
+else
+	bad "bootstrap without mode= or not recorded"
+	cat "$tmp/boot-args" "$b.state/juju.env"
 fi
 boot_ok otherimg LAB_JUJU_SOURCE=snap FAKE_API_IMAGE=example.com/x/jujud-operator:4.0.15
 if ((brc == 0)) && grep -qx agent_source=unknown "$b.state/juju.env"; then pass "bootstrap k8s: other image repo -> agent_source unknown"; else bad "bootstrap k8s other repo (rc $brc)"; cat "$b.out"; fi
@@ -751,9 +779,12 @@ declare -A paths=(
 	[k8s-build]='Set up LXD|Wait for LXD|Install juju snap|Bootstrap (LXD build mode)'
 	[lxd-snap]="Set up MicroK8s|$bm"
 	[k8s-snap]="Set up LXD|Wait for LXD|$bm"
+	# k8s with DEPS=charmcraft also runs "Set up LXD" + "Wait for LXD".
+	[k8s-build+charmcraft]='Install juju snap|Bootstrap (LXD build mode)'
+	[k8s-snap+charmcraft]="$bm"
 )
 worst=0
-for pth in lxd-build k8s-build lxd-snap k8s-snap; do
+for pth in lxd-build k8s-build lxd-snap k8s-snap k8s-build+charmcraft k8s-snap+charmcraft; do
 	sum=$(path_sum "${paths[$pth]}")
 	((sum > worst)) && worst=$sum
 	if [[ $job_tm =~ ^[0-9]+$ ]] && ((sum <= job_tm)); then :; else bad "budget: $pth step timeouts sum to $sum min > job timeout-minutes ${job_tm:-unset}"; fi
@@ -965,7 +996,7 @@ boot_build() {
 }
 bline='Building local Juju agent binary version <nil> for amd64'
 boot_build lxdok localhost FAKE_AGENT=4.0.14.1 "FAKE_BOOT_OUT=$bline"
-if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$tmp/jsrc bootstrap localhost lab --debug --build-agent" "$tmp/bb.log"; then
+if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$tmp/jsrc bootstrap localhost lab --debug --build-agent --model-default mode=" "$tmp/bb.log"; then
 	pass "bootstrap build LXD: --build-agent from LAB_SRC, agent 4.0.14.1 + build line -> local"
 else
 	bad "bootstrap build LXD ok (rc $brc)"
@@ -1012,7 +1043,7 @@ else
 	cat "$b.out"
 fi
 boot_build k8sok microk8s FAKE_AGENT=4.0.14 FAKE_API_IMAGE=ghcr.io/juju/jujud-operator:4.0.14 FAKE_API_ID="$cfg"
-if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$PWD bootstrap microk8s lab --debug --agent-version=4.0.14" "$tmp/bb.log" &&
+if ((brc == 0)) && grep -qx agent_source=local "$b.state/juju.env" && grep -qx "$PWD bootstrap microk8s lab --debug --agent-version=4.0.14 --model-default mode=" "$tmp/bb.log" &&
 	! grep -q 'juju:peers' "$b.out"; then
 	pass "bootstrap build k8s: --agent-version, api-server imageID = imported config digest -> local"
 else
@@ -1186,7 +1217,8 @@ fi
 # Agent, deps, branch warning, bootstrap excerpt.
 art="$tmp/art-agent"
 pipeline "$art" scenarios selftest 1
-printf '%s\n' controller_agent_version=4.0.15 agent_source=packaged 'dep_charmcraft=4.x/stable 8265' \
+printf '%s\n' controller_agent_version=4.0.15 agent_source=packaged 'dep_charmcraft=4.x/stable 8265' 'dep_lxd=5.21/stable 33110' \
+	'bootstrap_args=--model-default mode=' \
 	tests_sha=0123456789abcdef0123456789abcdef01234567 tests_source=branch bootstrap_failed=1 >"$art.state/juju.env"
 printf '%s\n' scrub_hits=0 upload_blocked=false upload_blocked_path= scrub_dropped=0 scrub_withheld=0 >"$art.state/scrub.env"
 mkdir -p "$art/collect" && printf 'boot line %s\n' 1 2 3 >"$art/collect/bootstrap.log"
@@ -1194,8 +1226,8 @@ mkdir -p "$art/collect" && printf 'boot line %s\n' 1 2 3 >"$art/collect/bootstra
 env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_UPLOAD_DIR="$art" LAB_SUBSTRATE=lxd \
 	VALIDATE_OUTCOME=success READY_OUTCOME=skipped SCENARIO_OUTCOME=skipped GITHUB_STEP_SUMMARY="$art.summary" \
 	bash scripts/verdict.sh >"$tmp/log" 2>&1
-check "verdict: controller_agent_version, agent_source, deps [{name, channel, revision}]" "$art" \
-	'.controller_agent_version == "4.0.15" and .agent_source == "packaged" and .deps == [{"name":"charmcraft","channel":"4.x/stable","revision":8265}] and .scrub_dropped == 0'
+check "verdict: controller_agent_version, agent_source, deps [{name, channel, revision}] incl. LXD for charmcraft, bootstrap_args" "$art" \
+	'.controller_agent_version == "4.0.15" and .agent_source == "packaged" and .deps == [{"name":"charmcraft","channel":"4.x/stable","revision":8265},{"name":"lxd","channel":"5.21/stable","revision":33110}] and .bootstrap_args == "--model-default mode=" and .scrub_dropped == 0'
 if grep -q '^\*\*Warning:\*\* tests/ came from the branch head' "$art.summary" && grep -q 'Last 30 lines of collect/bootstrap.log' "$art.summary" && grep -qx 'boot line 3' "$art.summary"; then
 	pass "summary: branch tests warning and bootstrap log excerpt"
 else
@@ -1264,8 +1296,10 @@ esac
 FAKE
 cat >"$fo/sg" <<'FAKE'
 #!/usr/bin/env bash
-cat >/dev/null
+# Only the import reads stdin (docker save | sg ...). Reading it for `images ls`
+# too blocked on a terminal stdin until `timeout 60` (box-only failure).
 case $3 in
+*"image import"*) cat >/dev/null ;;
 *"images ls"*) echo "REF TYPE DIGEST"; echo "$LAB_OPERATOR_IMAGE application/x sha256:$(printf 'd%.0s' {1..64})" ;;
 esac
 FAKE

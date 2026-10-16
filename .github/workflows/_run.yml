@@ -124,9 +124,13 @@ jobs:
           df -h | tee "$LAB_ARTIFACT_DIR/collect/df-after-free.txt"
 
       # --- Setup (NEEDS_JUJU=1 only). Every failure here is setup-error. ---
+      # Also on k8s when DEPS has charmcraft: charmcraft packs charms in an LXD
+      # instance (sidecar test_rootless; without it "user must be manually added
+      # to 'lxd' group"). "Wait for LXD" follows it on both; the LXD-substrate
+      # steps below stay LXD-only.
       - name: Set up LXD
         id: lxd
-        if: steps.validate.outputs.needs_juju == '1' && inputs.substrate == 'lxd'
+        if: steps.validate.outputs.needs_juju == '1' && (inputs.substrate == 'lxd' || contains(format(' {0} ', steps.validate.outputs.deps), ' charmcraft '))
         timeout-minutes: 10
         uses: canonical/setup-lxd@8c6a87bfb56aa48f3fb9b830baa18562d8bfd4ee # v1
         with:
@@ -135,17 +139,20 @@ jobs:
           # installed revision is recorded in verdict.substrate_snap.
           channel: 5.21/stable
 
-      # Copied from juju/juju smoke.yml, with a bound; then records the LXD snap.
+      # Copied from juju/juju smoke.yml, with a bound; then records the LXD snap:
+      # as the substrate on LXD, as dep_lxd (held, verdict.deps[]) when it was
+      # set up for charmcraft on k8s.
       - name: Wait for LXD
         id: lxdwait
-        if: steps.validate.outputs.needs_juju == '1' && inputs.substrate == 'lxd'
+        if: steps.validate.outputs.needs_juju == '1' && steps.lxd.outcome == 'success'
         timeout-minutes: 3
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
         run: |
           for _ in $(seq 1 18); do
             if ip link show lxdbr0; then
-              exec scripts/record-substrate.sh lxd
+              if [ "$LAB_SUBSTRATE" = lxd ]; then exec scripts/record-substrate.sh lxd; fi
+              exec scripts/record-substrate.sh --dep lxd
             fi
             echo "Waiting for lxdbr0..."
             sleep 10
@@ -224,6 +231,8 @@ jobs:
         run: scripts/resolve-tests.sh
 
       # Snap mode or an explicit tests_ref; build mode otherwise uses juju-src/tests.
+      # testcharms/ too: suites pack local charms from ./testcharms/charms/*
+      # (relations, hooks, sidecar, deploy, storage).
       - name: Checkout juju/juju tests
         id: tests_checkout
         if: steps.validate.outputs.needs_tests == '1' && steps.tests.outputs.tests_checkout == '1'
@@ -233,7 +242,9 @@ jobs:
           repository: juju/juju
           ref: ${{ steps.tests.outputs.tests_sha }}
           path: juju-tests
-          sparse-checkout: tests
+          sparse-checkout: |
+            tests
+            testcharms
           fetch-depth: 1
           persist-credentials: false
 

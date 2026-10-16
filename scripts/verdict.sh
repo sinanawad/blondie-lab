@@ -155,6 +155,7 @@ jq -n \
 	--arg scrub_dropped "$(s_ scrub_dropped)" --arg scrub_withheld "$(s_ scrub_withheld)" \
 	--arg agent "$(s_ controller_agent_version)" --arg agent_source "$(s_ agent_source)" \
 	--argjson deps "$deps_json" --argjson images "$images_json" --arg snap_drift "$(s_ snap_drift)" \
+	--arg bootstrap_args "$(s_ bootstrap_args)" \
 	--slurpfile results "$results" '
 	def v(x): if x != "" then x else null end;
 	{
@@ -166,6 +167,7 @@ jq -n \
 		juju_channel: (if $no_juju or $source == "build" then null else v($channel) end),
 		controller_agent_version: v($agent), agent_source: v($agent_source),
 		controller_images: $images,
+		bootstrap_args: v($bootstrap_args),
 		source: (if $no_juju then "none" else v($source) end),
 		ref: v($ref), ref_sha: v($ref_sha), build: $build,
 		tests_ref: v($tests_ref), tests_sha: v($tests_sha), tests_source: v($tests_source),

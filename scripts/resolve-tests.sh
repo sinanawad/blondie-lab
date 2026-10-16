@@ -4,7 +4,7 @@
 #   build mode: ref_sha (tests come from the build checkout), tests_source ref;
 #   snap mode: the snap's git-commit; else tag v<version>; else the
 #   <major.minor> branch head (with a warning).
-# Outputs tests_sha= and tests_checkout= (1: sparse checkout of tests/ needed,
+# Outputs tests_sha= and tests_checkout= (1: sparse checkout of tests/ + testcharms/ needed,
 # 0: use $LAB_SRC/tests); records tests_sha/tests_source.
 set -euo pipefail
 export LC_ALL=C
