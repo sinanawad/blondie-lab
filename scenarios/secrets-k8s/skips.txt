@@ -1,0 +1,1 @@
+test_secrets_cmr_cross_controller design §5: bootstraps a second controller (offer and consume across controllers), beyond the lab's one-controller budget. Un-skip decided from calibration headroom (plan PR-6).

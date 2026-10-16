@@ -1,0 +1,4 @@
+- **Note:** no skips. k8s only (the suite skips itself on non-k8s providers). Deploys sidecar charms from CharmHub into fresh models on the lab MicroK8s.
+- **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name.
+- **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
+- **Expected verdict:** `pass` on a healthy channel.

@@ -1,0 +1,4 @@
+- **Note:** the suite runs `microk8s enable ingress` / `rbac` (`|| true`). Its closing `destroy_controller` (with `KILL_CONTROLLER=true`) falls back to `destroy-model` on a reused controller, so the lab controller survives. `test_secrets_cmr` (same-controller cross-model secrets) runs. Secret values must not leak into artifacts: `scrub_hits` must be 0 on a clean run.
+- **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name.
+- **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
+- **Expected verdict:** `pass` on a healthy channel.

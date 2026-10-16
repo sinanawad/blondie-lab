@@ -1,0 +1,1 @@
+test_start_hook_fires_after_reboot design §5: reboots the unit's machine (sudo reboot) and waits for it to return; slow and not a dispatch check. Covered by its own scenario if needed.

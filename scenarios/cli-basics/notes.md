@@ -1,0 +1,4 @@
+- **Note:** no skips. `test_display_clouds` adds cloud `my-ec2` to the lab controller with `--force` (no credentials, nothing gets provisioned). That is harmless, because the controller is bootstrapped per run. `test_unregister` works on a throwaway `JUJU_DATA`, so the lab controller stays registered.
+- **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name.
+- **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
+- **Expected verdict:** `pass` on a healthy channel.
