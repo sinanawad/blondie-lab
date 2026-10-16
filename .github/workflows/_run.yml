@@ -97,7 +97,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LAB_REF: ${{ steps.validate.outputs.ref }}
           LAB_TESTS_REF: ${{ steps.validate.outputs.tests_ref }}
-        run: scripts/ref-trust.sh
+          DRILL_API: ${{ startsWith(inputs.request_id, 'drill-api') && '1' || '' }}
+        # DRILL (temporary, PR-5 acceptance): an unreachable API host.
+        run: |
+          if [ "${DRILL_API:-}" = 1 ]; then export GH_HOST=api.invalid; fi
+          exec scripts/ref-trust.sh
 
       # Build mode needs the room (design §2 "Disk"); df -h goes to the artifact.
       - name: Free disk (build mode)
@@ -215,12 +219,19 @@ jobs:
       # branch-scoped and unreadable from main) and only without an exact hit.
       - name: Save Go module cache (build mode, main only)
         id: gomod_save
-        if: steps.validate.outputs.source == 'build' && github.ref == 'refs/heads/main' && steps.gomod_restore.outputs.cache-hit != 'true'
+        # DRILL (temporary, PR-5 cache measurement): also from drill-cache runs on the PR branch.
+        if: steps.validate.outputs.source == 'build' && (github.ref == 'refs/heads/main' || startsWith(inputs.request_id, 'drill-cache')) && steps.gomod_restore.outputs.cache-hit != 'true'
         timeout-minutes: 5
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/go/pkg/mod
           key: gomod-${{ steps.trust.outputs.ref_line }}-${{ hashFiles('juju-src/go.sum') }}
+
+      # DRILL (temporary, PR-5 acceptance): a juju snap next to the build.
+      - name: "DRILL: install the juju snap in build mode"
+        if: steps.validate.outputs.source == 'build' && startsWith(inputs.request_id, 'drill-snap')
+        timeout-minutes: 5
+        run: sudo snap install juju --channel=4.0/stable
 
       - name: Resolve tests ref
         id: tests
