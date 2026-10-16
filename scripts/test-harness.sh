@@ -437,6 +437,9 @@ suite_case() {
 	fi
 }
 # TMPDIR for the suite: inside the tests checkout, not /tmp (snap juju can't read /tmp).
+# This only asserts the value; it can't model the snap's private /tmp. The live
+# cli-basics run (cli model_config/model_defaults hand mktemp files to juju) is
+# the real test.
 td="$tmp/tests-tmpdir"
 mkdir -p "$td"
 cat >"$td/main.sh" <<'FAKE'
@@ -724,7 +727,12 @@ else
 	bad "bootstrap k8s images (rc $brc)"
 	cat "$b.out" "$b.state/juju.env"
 fi
-if grep -q -- '--model-default mode=' "$tmp/boot-args"; then pass "bootstrap: --model-default mode= (no confirmation prompts, as juju/juju tests)"; else bad "bootstrap without mode="; cat "$tmp/boot-args"; fi
+if grep -q -- '--model-default mode=' "$tmp/boot-args" && grep -qx 'bootstrap_args=--model-default mode=' "$b.state/juju.env"; then
+	pass "bootstrap: --model-default mode= (no confirmation prompts, as juju/juju tests), recorded as bootstrap_args"
+else
+	bad "bootstrap without mode= or not recorded"
+	cat "$tmp/boot-args" "$b.state/juju.env"
+fi
 boot_ok otherimg LAB_JUJU_SOURCE=snap FAKE_API_IMAGE=example.com/x/jujud-operator:4.0.15
 if ((brc == 0)) && grep -qx agent_source=unknown "$b.state/juju.env"; then pass "bootstrap k8s: other image repo -> agent_source unknown"; else bad "bootstrap k8s other repo (rc $brc)"; cat "$b.out"; fi
 boot_ok snapnoplug LAB_JUJU_SOURCE=snap FAKE_NO_SNAP=1
@@ -769,9 +777,12 @@ declare -A paths=(
 	[k8s-build]='Set up LXD|Wait for LXD|Install juju snap|Bootstrap (LXD build mode)'
 	[lxd-snap]="Set up MicroK8s|$bm"
 	[k8s-snap]="Set up LXD|Wait for LXD|$bm"
+	# k8s with DEPS=charmcraft also runs "Set up LXD" + "Wait for LXD".
+	[k8s-build+charmcraft]='Install juju snap|Bootstrap (LXD build mode)'
+	[k8s-snap+charmcraft]="$bm"
 )
 worst=0
-for pth in lxd-build k8s-build lxd-snap k8s-snap; do
+for pth in lxd-build k8s-build lxd-snap k8s-snap k8s-build+charmcraft k8s-snap+charmcraft; do
 	sum=$(path_sum "${paths[$pth]}")
 	((sum > worst)) && worst=$sum
 	if [[ $job_tm =~ ^[0-9]+$ ]] && ((sum <= job_tm)); then :; else bad "budget: $pth step timeouts sum to $sum min > job timeout-minutes ${job_tm:-unset}"; fi
@@ -1194,7 +1205,8 @@ fi
 # Agent, deps, branch warning, bootstrap excerpt.
 art="$tmp/art-agent"
 pipeline "$art" scenarios selftest 1
-printf '%s\n' controller_agent_version=4.0.15 agent_source=packaged 'dep_charmcraft=4.x/stable 8265' \
+printf '%s\n' controller_agent_version=4.0.15 agent_source=packaged 'dep_charmcraft=4.x/stable 8265' 'dep_lxd=5.21/stable 33110' \
+	'bootstrap_args=--model-default mode=' \
 	tests_sha=0123456789abcdef0123456789abcdef01234567 tests_source=branch bootstrap_failed=1 >"$art.state/juju.env"
 printf '%s\n' scrub_hits=0 upload_blocked=false upload_blocked_path= scrub_dropped=0 scrub_withheld=0 >"$art.state/scrub.env"
 mkdir -p "$art/collect" && printf 'boot line %s\n' 1 2 3 >"$art/collect/bootstrap.log"
@@ -1202,8 +1214,8 @@ mkdir -p "$art/collect" && printf 'boot line %s\n' 1 2 3 >"$art/collect/bootstra
 env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_UPLOAD_DIR="$art" LAB_SUBSTRATE=lxd \
 	VALIDATE_OUTCOME=success READY_OUTCOME=skipped SCENARIO_OUTCOME=skipped GITHUB_STEP_SUMMARY="$art.summary" \
 	bash scripts/verdict.sh >"$tmp/log" 2>&1
-check "verdict: controller_agent_version, agent_source, deps [{name, channel, revision}]" "$art" \
-	'.controller_agent_version == "4.0.15" and .agent_source == "packaged" and .deps == [{"name":"charmcraft","channel":"4.x/stable","revision":8265}] and .scrub_dropped == 0'
+check "verdict: controller_agent_version, agent_source, deps [{name, channel, revision}] incl. LXD for charmcraft, bootstrap_args" "$art" \
+	'.controller_agent_version == "4.0.15" and .agent_source == "packaged" and .deps == [{"name":"charmcraft","channel":"4.x/stable","revision":8265},{"name":"lxd","channel":"5.21/stable","revision":33110}] and .bootstrap_args == "--model-default mode=" and .scrub_dropped == 0'
 if grep -q '^\*\*Warning:\*\* tests/ came from the branch head' "$art.summary" && grep -q 'Last 30 lines of collect/bootstrap.log' "$art.summary" && grep -qx 'boot line 3' "$art.summary"; then
 	pass "summary: branch tests warning and bootstrap log excerpt"
 else
@@ -1272,8 +1284,10 @@ esac
 FAKE
 cat >"$fo/sg" <<'FAKE'
 #!/usr/bin/env bash
-cat >/dev/null
+# Only the import reads stdin (docker save | sg ...). Reading it for `images ls`
+# too blocked on a terminal stdin until `timeout 60` (box-only failure).
 case $3 in
+*"image import"*) cat >/dev/null ;;
 *"images ls"*) echo "REF TYPE DIGEST"; echo "$LAB_OPERATOR_IMAGE application/x sha256:$(printf 'd%.0s' {1..64})" ;;
 esac
 FAKE

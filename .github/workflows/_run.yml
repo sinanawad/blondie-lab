@@ -126,7 +126,8 @@ jobs:
       # --- Setup (NEEDS_JUJU=1 only). Every failure here is setup-error. ---
       # Also on k8s when DEPS has charmcraft: charmcraft packs charms in an LXD
       # instance (sidecar test_rootless; without it "user must be manually added
-      # to 'lxd' group"). The LXD-substrate steps below stay LXD-only.
+      # to 'lxd' group"). "Wait for LXD" follows it on both; the LXD-substrate
+      # steps below stay LXD-only.
       - name: Set up LXD
         id: lxd
         if: steps.validate.outputs.needs_juju == '1' && (inputs.substrate == 'lxd' || contains(format(' {0} ', steps.validate.outputs.deps), ' charmcraft '))
@@ -138,17 +139,20 @@ jobs:
           # installed revision is recorded in verdict.substrate_snap.
           channel: 5.21/stable
 
-      # Copied from juju/juju smoke.yml, with a bound; then records the LXD snap.
+      # Copied from juju/juju smoke.yml, with a bound; then records the LXD snap:
+      # as the substrate on LXD, as dep_lxd (held, verdict.deps[]) when it was
+      # set up for charmcraft on k8s.
       - name: Wait for LXD
         id: lxdwait
-        if: steps.validate.outputs.needs_juju == '1' && inputs.substrate == 'lxd'
+        if: steps.validate.outputs.needs_juju == '1' && steps.lxd.outcome == 'success'
         timeout-minutes: 3
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
         run: |
           for _ in $(seq 1 18); do
             if ip link show lxdbr0; then
-              exec scripts/record-substrate.sh lxd
+              if [ "$LAB_SUBSTRATE" = lxd ]; then exec scripts/record-substrate.sh lxd; fi
+              exec scripts/record-substrate.sh --dep lxd
             fi
             echo "Waiting for lxdbr0..."
             sleep 10
