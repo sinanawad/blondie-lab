@@ -211,6 +211,15 @@ jobs:
           LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
         run: scripts/build-juju.sh
 
+      # DRILL (temporary, PR-5 acceptance): drop the imported operator image so
+      # bootstrap pulls the public one with the same tag.
+      - name: "DRILL: remove the imported operator image"
+        if: steps.build.outcome == 'success' && inputs.substrate == 'k8s' && startsWith(inputs.request_id, 'drill-noimport')
+        timeout-minutes: 2
+        env:
+          DRILL_IMAGE: ghcr.io/juju/jujud-operator:${{ steps.build.outputs.juju_version }}
+        run: sudo microk8s ctr --namespace k8s.io images rm "$DRILL_IMAGE"
+
       - name: Resolve tests ref
         id: tests
         if: steps.validate.outputs.needs_tests == '1'
@@ -283,6 +292,7 @@ jobs:
           LAB_REF_SHA: ${{ steps.trust.outputs.ref_sha }}
           LAB_SRC: ${{ github.workspace }}/juju-src
           LAB_BOOTSTRAP_TIMEOUT: "1500"
+          LAB_DRILL: ${{ startsWith(inputs.request_id, 'drill-nobuildagent') && 'nobuildagent' || '' }}
         run: exec scripts/bootstrap.sh
 
       # Names the failed setup step when the step itself couldn't (actions).

@@ -65,6 +65,8 @@ if [[ $source == build ]]; then
 	echo "identity: $got, git-commit $commit ($tree), no juju snap"
 	if [[ $cloud == localhost ]]; then
 		extra=(--build-agent)
+		# DRILL (temporary, PR-5 acceptance): bootstrap without the build.
+		if [[ ${LAB_DRILL:-} == nobuildagent ]]; then extra=(); echo "DRILL: no --build-agent"; fi
 		# --build-agent runs make from the juju tree containing the cwd.
 		cd "${LAB_SRC:?}"
 	else
