@@ -649,11 +649,13 @@ cleanup_run nslxd LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
 if ((crc == 0)) && ! grep -q kubectl "$tmp/fake.log"; then pass "cleanup lxd: no namespace wait"; else bad "cleanup lxd (rc $crc)"; cat "$tmp/nslxd.out"; fi
 # All users' models, by qualified name: another user's model with the same
 # short name is destroyed too, and separately.
-printf '%s\n' admin/m1 bob/m1 >"$tmp/fake.models"
+printf '%s\n' admin/m1 bob/m1 bob/controller >"$tmp/fake.models"
 cleanup_run allusers LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
 if ((crc == 0)) && grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:admin/m1' "$tmp/fake.log" &&
-	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/m1' "$tmp/fake.log" && [[ ! -s $tmp/fake.models ]]; then
-	pass "cleanup: models --all, every user's model destroyed by qualified name"
+	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/m1' "$tmp/fake.log" &&
+	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/controller' "$tmp/fake.log" &&
+	! grep -q 'lab:admin/controller' "$tmp/fake.log" && [[ ! -s $tmp/fake.models ]]; then
+	pass "cleanup: models --all, every user's model destroyed by qualified name (bob/controller too, never admin/controller)"
 else
 	bad "cleanup all users (rc $crc)"
 	cat "$tmp/allusers.out" "$tmp/fake.log"
@@ -833,6 +835,16 @@ if ((nrc == 1)) && grep -qx 'drill: suite passed but its teardown left models af
 else
 	bad "no-models-left other user (rc $nrc)"
 	cat "$tmp/nmlother.out"
+fi
+# Only the controller model itself is excluded: another user's model named
+# "controller" is a leftover like any other.
+echo bob/controller >"$tmp/fake.models"
+nml nmlbobctl LAB_SUBSTRATE=lxd
+if ((nrc == 1)) && grep -qx 'drill: suite passed but its teardown left models after 3s: bob/controller' "$tmp/nmlbobctl.out"; then
+	pass "no-models-left: bob/controller is not the controller model -> fail"
+else
+	bad "no-models-left bob/controller (rc $nrc)"
+	cat "$tmp/nmlbobctl.out"
 fi
 : >"$tmp/fake.models"
 
