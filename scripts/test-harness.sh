@@ -73,7 +73,7 @@ expect 2 "SUBSTRATE mismatch (lxd scenario on k8s)" lxd-only 1 "needs SUBSTRATE=
 expect 2 "NEEDS_JUJU=0 with SUBSTRATE=lxd" lxd-only 1 "NEEDS_JUJU=0 requires SUBSTRATE=any" LAB_SUBSTRATE=lxd
 expect 2 "NEEDS_JUJU=0 with DEPS" nojuju-deps 1 "NEEDS_JUJU=0 excludes"
 expect 2 "unknown DEPS word rejected at input" juju-baddeps 1 "DEPS: unknown dependency 'nonexistent'" LAB_SUBSTRATE=lxd
-expect 2 "Juju scenario on k8s (PR-4)" juju 1 "the k8s substrate is not implemented yet (plan PR-4)"
+expect 0 "Juju scenario on k8s" juju 1 "needs_juju=1 needs_tests=0 deps= juju_channel=4.0/stable"
 expect 0 "Juju scenario on lxd" juju 1 "needs_juju=1 needs_tests=0 deps= juju_channel=4.0/stable" LAB_SUBSTRATE=lxd
 expect 0 "Juju scenario with tests + DEPS on lxd" juju-tests 2 "needs_juju=1 needs_tests=1 deps=charmcraft scenario_timeout=16" LAB_SUBSTRATE=lxd
 expect 2 "ref on a Juju scenario (build mode not implemented yet)" juju 1 "build mode is not implemented" LAB_IN_REF=v4.0.14 LAB_SUBSTRATE=lxd
@@ -291,6 +291,8 @@ bypass_case 'escaped JSON (logsink.log)' '{\"password\":<redacted>,\"x\":1}' '{\
 bypass_case 'quoted multi-word value' 'password: <redacted> tail' 'password: "two words" tail'
 bypass_case 'value on the next line (|)' '    <redacted>' 'admin-secret: |' '    line one' '    line two' 'next: 1'
 bypass_case 'empty value, list on the next line' '  <redacted>' 'statepassword:' '  - deep' 'other: 1'
+bypass_case 'kubeconfig client-key-data' '    client-key-data: <redacted>' '    client-key-data: QUJDREVGRw=='
+bypass_case 'bearer token (k8s credential)' '  token: <redacted>' '  token: eyJhbGciOiJSUzI1NiJ9.abc'
 bypass_case 'macaroon-<id>= cookie' 'macaroon-abc_12-z=<redacted> Path=/' 'macaroon-abc_12-z=eyJhYmMi; Path=/'
 rm -rf "$tmp/bp" && mkdir -p "$tmp/bp" && printf '%s\n' 'admin-secret: |' '    line one' 'next: 1' >"$tmp/bp/f.txt" && scrub_run bp
 if grep -qx 'next: 1' "$tmp/bp.up/f.txt" && ! grep -q 'line one' "$tmp/bp.up/f.txt"; then pass "scrub: YAML block ends at the next key"; else bad "scrub block end"; cat "$tmp/bp.up/f.txt"; fi
@@ -514,6 +516,126 @@ pipeline "$tmp/art-clean-stuck" "$tmp/scen" leaves-model 3 PATH="$fj:$PATH" LAB_
 	FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log" FAKE_STUCK=1 LAB_CLEANUP_TIMEOUT=2
 check "cleanup: unfinished cleanup stops the loop -> setup-error" "$tmp/art-clean-stuck" \
 	'.verdict == "setup-error" and (.results | length) == 1 and .results[0].verdict == "pass" and (.reason | test("cleanup after iteration 1"))'
+
+# --- k8s: cleanup namespace wait, bootstrap watchdog ------------------------------
+# Fake microk8s (lab-kubectl execs `microk8s kubectl`): namespaces are lines in
+# $FAKE_NS ("name label"); `get ns NAME` decrements $FAKE_NS_DIR/NAME (calls
+# left until gone, absent = gone).
+fk="$tmp/fake-k8s"
+mkdir -p "$fk"
+cat >"$fk/microk8s" <<'FAKE'
+#!/usr/bin/env bash
+[[ $1 == kubectl ]] || exit 0
+shift
+echo "kubectl $*" >>"$FAKE_LOG"
+if [[ $1 == get && $2 == ns && $3 == -l ]]; then
+	for f in "$FAKE_NS_DIR"/*; do
+		[[ -f $f ]] || continue
+		n=${f##*/}
+		printf '{"metadata":{"name":"%s","labels":{"model.juju.is/name":"%s"}}}\n' "$n" "$(sed -n 2p "$f")"
+	done | jq -s '{items: .}'
+	exit 0
+fi
+if [[ $1 == get && $2 == ns && -n ${3:-} ]]; then
+	f="$FAKE_NS_DIR/$3"
+	[[ -f $f ]] || { echo "Error from server (NotFound): namespaces \"$3\" not found" >&2; exit 1; }
+	left=$(sed -n 1p "$f")
+	label=$(sed -n 2p "$f")
+	if [[ $left == stuck ]]; then echo "namespace/$3"; exit 0; fi
+	if ((left <= 1)); then rm -f "$f"; echo "namespace/$3"; exit 0; fi
+	printf '%s\n%s\n' $((left - 1)) "$label" >"$f"
+	echo "namespace/$3"
+	exit 0
+fi
+echo "fake kubectl $*"
+FAKE
+chmod +x "$fk/microk8s"
+nsd="$tmp/fake-ns"
+fakens() { rm -rf "$nsd" && mkdir -p "$nsd" && while (($#)); do printf '%s\n%s\n' "$2" "$3" >"$nsd/$1"; shift 3; done; }
+cleanup_run() { # cleanup_run <name> [VAR=value...]
+	local n=$1
+	shift
+	: >"$tmp/fake.log"
+	crc=0
+	env -i PATH="$fk:$fj:$PATH" HOME="$tmp" LAB_CONTROLLER=lab FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log" \
+		FAKE_NS_DIR="$nsd" "$@" bash scripts/cleanup-models.sh >"$tmp/$n.out" 2>&1 || crc=$?
+}
+echo m1 >"$tmp/fake.models"
+fakens m1 3 m1 suite-ns 2 suite-ns controller-lab stuck controller
+cleanup_run nsok LAB_SUBSTRATE=k8s
+if ((crc == 0)) && grep -qx 'cleanup: namespace m1 gone (NotFound)' "$tmp/nsok.out" &&
+	grep -qx 'cleanup: namespace suite-ns gone (NotFound)' "$tmp/nsok.out" &&
+	tail -n 1 "$tmp/nsok.out" | grep -qx 'cleanup: no model namespaces left' && ! grep -q 'controller-lab' "$tmp/nsok.out"; then
+	pass "cleanup k8s: waits for the destroyed model's and a labelled leftover namespace, not the controller's"
+else
+	bad "cleanup k8s namespace wait (rc $crc)"
+	cat "$tmp/nsok.out"
+fi
+echo m1 >"$tmp/fake.models"
+fakens m1 stuck m1
+cleanup_run nsstuck LAB_SUBSTRATE=k8s LAB_CLEANUP_TIMEOUT=3
+if ((crc == 1)) && grep -q 'cleanup: still present after 3s: m1' "$tmp/nsstuck.out"; then
+	pass "cleanup k8s: a namespace still there when the shared budget runs out -> exit 1"
+else
+	bad "cleanup k8s stuck namespace (rc $crc)"
+	cat "$tmp/nsstuck.out"
+fi
+echo m1 >"$tmp/fake.models"
+fakens m1 stuck m1
+cleanup_run nslxd LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
+if ((crc == 0)) && ! grep -q kubectl "$tmp/fake.log"; then pass "cleanup lxd: no namespace wait"; else bad "cleanup lxd (rc $crc)"; cat "$tmp/nslxd.out"; fi
+
+# bootstrap.sh watchdog: a hung bootstrap is dumped (k8s) before juju is killed.
+fb="$tmp/fake-boot"
+mkdir -p "$fb"
+cat >"$fb/juju" <<'FAKE'
+#!/usr/bin/env bash
+case $1 in
+clouds) echo '{"microk8s":{"type":"k8s"}}' ;;
+bootstrap) echo "$$" >"$FAKE_PID"; exec sleep 60 ;;
+esac
+FAKE
+cat >"$fb/snap" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' 'Interface Plug Slot Notes' 'content[microk8s] juju:peers microk8s:microk8s -'
+FAKE
+printf '#!/usr/bin/env bash\n"$@"\n' >"$fb/sudo"
+printf '#!/usr/bin/env bash\necho journal "$@"\n' >"$fb/journalctl"
+chmod +x "$fb"/*
+fakens m1 stuck m1
+for cl in microk8s localhost; do
+	b="$tmp/boot-$cl"
+	mkdir -p "$b.state"
+	brc=0
+	env -i PATH="$fb:$fk:$PATH" HOME="$tmp" LAB_CONTROLLER=lab LAB_CLOUD=$cl LAB_BOOTSTRAP_TIMEOUT=3 LAB_ARTIFACT_DIR="$b" \
+		LAB_STATE_DIR="$b.state" FAKE_PID="$b.pid" FAKE_LOG="$tmp/fake.log" FAKE_NS_DIR="$nsd" \
+		bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
+	sleep 1
+	if ((brc == 2)) && grep -q "timed out after 3s" "$b.state/setup-error.txt" && grep -qx bootstrap_failed=1 "$b.state/juju.env" &&
+		! kill -0 "$(cat "$b.pid")" 2>/dev/null; then
+		if [[ $cl == microk8s ]]; then
+			if [[ -s $b/collect/k8s-bootstrap-timeout/get-all.txt && -s $b/collect/k8s-bootstrap-timeout/journal-microk8s.txt ]] &&
+				grep -q 'dumped to collect/k8s-bootstrap-timeout/ before teardown' "$b.out"; then
+				pass "bootstrap watchdog (microk8s): k8s state dumped, then juju killed -> setup-error"
+			else
+				bad "bootstrap watchdog: no k8s dump"
+				cat "$b.out"
+			fi
+		elif [[ ! -e $b/collect/k8s-bootstrap-timeout ]]; then
+			pass "bootstrap watchdog (localhost): juju killed -> setup-error, no k8s dump"
+		else
+			bad "bootstrap watchdog (localhost) dumped k8s"
+		fi
+	else
+		bad "bootstrap watchdog ($cl, rc $brc)"
+		cat "$b.out" "$b.state/setup-error.txt"
+	fi
+done
+b="$tmp/boot-bad"
+mkdir -p "$b.state"
+brc=0
+env -i PATH="$fb:$PATH" LAB_CONTROLLER=lab LAB_CLOUD=aws LAB_ARTIFACT_DIR="$b" LAB_STATE_DIR="$b.state" bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
+if ((brc == 2)) && grep -q 'LAB_CLOUD: unexpected value' "$b.state/setup-error.txt"; then pass "bootstrap: LAB_CLOUD outside localhost|microk8s -> setup-error"; else bad "bootstrap bad cloud"; fi
 
 # --- verdict.sh: juju + scrub state -> verdict.json, job outputs ----------------------
 art="$tmp/art-jujustate"

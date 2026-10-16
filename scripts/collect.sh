@@ -4,6 +4,9 @@
 # collect.log, so an upload never hides the real failure. Every later command
 # is best effort, under timeout, logged to collect.log. Never collected:
 # accounts.yaml, agent.conf, *.key, kubeconfigs, /var/lib/juju.
+# On k8s (LAB_SUBSTRATE=k8s) the step runs under `sg snap_microk8s` and adds
+# collect/k8s/ (scripts/k8s-dump.sh); it runs before Teardown, so a failed or
+# timed-out bootstrap is dumped while its pods still exist.
 set -uo pipefail
 export LC_ALL=C
 
@@ -50,6 +53,14 @@ if command -v juju >/dev/null && [[ -n $controller ]] && timeout 30 juju show-co
 	done
 else
 	echo "juju or controller '$controller' not available; skipping juju collection" >>"$LOG"
+fi
+
+if [[ ${LAB_SUBSTRATE:-} == k8s ]]; then
+	if command -v microk8s >/dev/null; then
+		"$here/k8s-dump.sh" "$C/k8s" "$LOG"
+	else
+		echo "microk8s not installed; skipping k8s collection" >>"$LOG"
+	fi
 fi
 
 if command -v lxc >/dev/null; then

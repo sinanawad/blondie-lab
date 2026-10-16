@@ -26,3 +26,17 @@ state_get() {
 	[[ -f $f ]] || return 0
 	sed -n "s/^$1=//p" "$f" | tail -n 1
 }
+
+# record_substrate <snap>: record the substrate snap's tracked channel and
+# installed revision (verdict.substrate_snap). Called by the substrate setup
+# step that installed it.
+record_substrate() {
+	local name=$1 rev channel
+	rev=$(snap list "$name" | awk 'NR == 2 {print $3}')
+	channel=$(snap info "$name" | sed -n 's/^tracking: *//p')
+	[[ $rev =~ ^[0-9]+$ ]] || setup_fail "could not read the $name snap revision ('$rev')"
+	state_set substrate_snap_name "$name"
+	state_set substrate_snap_channel "$channel"
+	state_set substrate_snap_revision "$rev"
+	echo "substrate: $name rev $rev ($channel)"
+}

@@ -11,7 +11,7 @@
 use strict;
 use warnings;
 
-my $KEY = qr/(?:password|apipassword|statepassword|oldpassword|admin-secret|macaroons?(?:-[\w-]+)?)/i;
+my $KEY = qr/(?:password|apipassword|statepassword|oldpassword|admin-secret|macaroons?(?:-[\w-]+)?|client-key-data|token)/i;
 my $SEP = qr/\\?["']?[ \t]*[:=][ \t]*/;
 my $VAL = qr/\\"(?:(?!\\").)*\\"|"(?:[^"\\\n]|\\.)*"|'[^'\n]*'|[^\s]+/;
 my $OPEN = qr/${KEY}${SEP}(?:[|>][-+0-9]*)?[ \t]*\r?$/;

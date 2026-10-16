@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# One-word kubectl for the lab (design §4): MicroK8s' own kubectl, reached
+# through the snap_microk8s group (the calling step runs under
+# `sg snap_microk8s`), so no kubeconfig is ever written to disk.
+exec microk8s kubectl "$@"
