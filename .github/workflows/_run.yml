@@ -1,0 +1,128 @@
+# Reusable lab harness, called by lab-lxd.yml and lab-microk8s.yml.
+# No concurrency: or run-name: here (a called workflow that declares its
+# caller's concurrency group waits on its own caller). Per-job permissions can
+# only narrow what the calling job grants (contents: read).
+# Inputs reach the shell only through env:, never as ${{ inputs.* }} in run:.
+#
+# PR-2 scope: validate -> ready -> scenario -> verdict -> upload. Substrate setup,
+# bootstrap, collect.sh and scrub land in PR-3/PR-4; until then validate.sh
+# rejects scenarios with NEEDS_JUJU=1, ref (build mode), DEPS and NEEDS_TESTS=1
+# as setup-error.
+name: _run
+
+on:
+  workflow_call:
+    inputs:
+      substrate:
+        type: string
+        required: true
+      scenario:
+        type: string
+        required: true
+      juju_channel:
+        type: string
+        required: true
+      ref:
+        type: string
+        required: false
+        default: ""
+      tests_ref:
+        type: string
+        required: false
+        default: ""
+      repeat:
+        type: string
+        required: false
+        default: "1"
+      request_id:
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  lab:
+    name: lab
+    runs-on: ubuntu-24.04
+    # Backstop only (design §2); every step has its own timeout.
+    timeout-minutes: 260
+    permissions:
+      contents: read
+    env:
+      LAB_SUBSTRATE: ${{ inputs.substrate }}
+    steps:
+      - name: Checkout blondie-lab
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # LAB_ARTIFACT_DIR (uploaded, scenario-writable) and LAB_STATE_DIR (harness
+      # state: valid.env, validate-error.txt, results.jsonl) are set per step from
+      # runner.temp, never through $GITHUB_ENV.
+      - name: Validate inputs
+        id: validate
+        timeout-minutes: 3
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_IN_SCENARIO: ${{ inputs.scenario }}
+          LAB_IN_JUJU_CHANNEL: ${{ inputs.juju_channel }}
+          LAB_IN_REF: ${{ inputs.ref }}
+          LAB_IN_TESTS_REF: ${{ inputs.tests_ref }}
+          LAB_IN_REPEAT: ${{ inputs.repeat }}
+          LAB_IN_REQUEST_ID: ${{ inputs.request_id }}
+        run: scripts/validate.sh
+
+      # PR-3/PR-4: substrate setup and bootstrap steps go here, above "ready".
+
+      # Marker: success only if every step above succeeded (implicit success()).
+      # verdict.sh maps anything else to setup-error.
+      - name: Ready
+        id: ready
+        timeout-minutes: 1
+        run: "true"
+
+      - name: Run scenario
+        id: scenario
+        timeout-minutes: ${{ fromJSON(steps.validate.outputs.scenario_timeout) }}
+        env:
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_SCENARIO: ${{ steps.validate.outputs.scenario }}
+          LAB_REPEAT: ${{ steps.validate.outputs.repeat }}
+          LAB_TIMEOUT_MIN: ${{ steps.validate.outputs.timeout_min }}
+        run: scripts/run-scenario.sh
+
+      - name: Verdict and job summary
+        id: verdict
+        if: always()
+        timeout-minutes: 2
+        env:
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          READY_OUTCOME: ${{ steps.ready.outcome }}
+          SCENARIO_OUTCOME: ${{ steps.scenario.outcome }}
+        run: scripts/verdict.sh
+
+      # Uploads even if verdict.sh died (the job stays red: no verdict).
+      # PR-3: gate the full upload on scrub success; every other outcome
+      # uploads only verdict.json + collect.log.
+      - name: Upload artifact
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.verdict.outputs.artifact_name || format('lab-logs-invalid-{0}', github.run_id) }}
+          path: ${{ runner.temp }}/lab-artifacts
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Job result (green only for pass)
+        if: always()
+        timeout-minutes: 1
+        env:
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          echo "verdict: ${VERDICT:-missing}"
+          [ "${VERDICT:-}" = pass ]

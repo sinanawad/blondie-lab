@@ -25,13 +25,14 @@ Disposable, public Juju test lab run on GitHub Actions. Owner: @sinanawad. Opera
 ## Layout
 | Path | What |
 |---|---|
-| `.github/workflows/lab-lxd.yml` | Dispatch: run a scenario against Juju on LXD. **Currently a stub** that validates and echoes inputs |
-| `.github/workflows/lab-microk8s.yml` | Same on MicroK8s. **Currently a stub** |
+| `.github/workflows/lab-lxd.yml` | Dispatch: run a scenario on LXD. Thin caller of `_run.yml` (run-name, concurrency, permissions) |
+| `.github/workflows/lab-microk8s.yml` | Same on MicroK8s |
+| `.github/workflows/_run.yml` | Reusable harness: validate → scenario → verdict → upload. Juju substrates, bootstrap, log collection and scrub come next; until then only `NEEDS_JUJU=0` scenarios run |
 | `.github/workflows/lint.yml` | actionlint, zizmor (online audits, `--min-severity low`), shellcheck (by shebang), and the lint-fixtures check. Single job `lint` |
 | `zizmor.yml`, `lint-requirements.txt` | zizmor config (hash-pin policy for all actions) and its hash-pinned install |
 | `lint-fixtures/` | Known-bad files that each linter must keep failing on. Never move them into `.github/workflows/` |
-| `scripts/` | Shared helpers (`check-lint-fixtures.sh` now; harness scripts later) |
-| `scenarios/<name>/` | Planned: one folder per scenario with `run.sh`, `scenario.env`, `README.md` |
+| `scripts/` | `validate.sh` (inputs + scenario contract + time budget), `run-scenario.sh` (iteration loop), `verdict.sh` (`verdict.json` + job summary), `test-harness.sh` (offline unit tests, run by lint), `check-lint-fixtures.sh` |
+| `scenarios/<name>/` | One folder per scenario: `run.sh` (entrypoint), `scenario.env`, `README.md`. Permanent harness checks: `selftest`, `selftest-exit-{1,2,3,137}`, `selftest-flaky`, `selftest-hang` |
 
 ## Dispatch inputs (v1 contract)
 | Input | Meaning | Example |
@@ -45,7 +46,15 @@ Disposable, public Juju test lab run on GitHub Actions. Owner: @sinanawad. Opera
 
 `ref`/`tests_ref` must match `^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$` and may not start with `refs/` or contain `..`, `//`, `@{`, a trailing `/` or `.lock`.
 
-Outputs (from PR-2 on): artifact `lab-logs-<scenario>-<run_id>` with `verdict.json` (pass / fail / setup-error / inconclusive / error, with pinned SHAs) and logs; the job summary carries the verdict too. A missing `verdict.json` counts as failure.
+Outputs: one artifact per run, `lab-logs-<scenario>-<run_id>` (or `lab-logs-invalid-<run_id>` when `scenario` itself is invalid), with `verdict.json` (pass / fail / setup-error / inconclusive / error, with pinned SHAs), `results.jsonl` and logs; the job summary carries the verdict too. Download by run id with `gh run download <id> -p 'lab-logs-*'`, never by a name rebuilt from the inputs. A missing `verdict.json` or artifact counts as failure.
+
+`verdict.json` fields beyond the design schema: `reason` (why setup-error/error, else null), `failed` (number of `fail` iterations), and `source: "none"` for `NEEDS_JUJU=0` runs (`juju_channel` is then null). On a setup-error each input is echoed only if its own check passed (`request_id` is checked first), otherwise null.
+
+## Scenario contract (short)
+- `scenario.env` (parsed, never sourced): `SUBSTRATE=lxd|k8s|any`, `TIMEOUT_MIN=<per-iteration minutes>`, `NEEDS_TESTS=0|1`, `NEEDS_JUJU=0|1` (default 1; `0` = no substrate or bootstrap, e.g. `selftest`), `DEPS=<words>`. Unknown and repeated keys are rejected. `NEEDS_JUJU=0` requires `SUBSTRATE=any`, `NEEDS_TESTS=0`, no `DEPS`, and rejects a non-empty `ref`/`tests_ref`; `tests_ref` is rejected for `NEEDS_TESTS=0`, so an input is never silently ignored.
+- `run.sh` exit codes: `0` pass, `1` fail (bug reproduced / regression), `2` setup-error, `3` inconclusive, anything else error (the per-iteration timeout gives 124, or 137 after the 60 s kill grace; the loop stops after setup-error/error).
+- Time budget: `TIMEOUT_MIN × repeat + repeat + 5 × (repeat − 1) + 5 ≤ 120` minutes, checked before any setup.
+- Environment: `LAB_SUBSTRATE`, `LAB_ITERATION`, `LAB_REPEAT`, `LAB_ARTIFACT_DIR` (files written there are uploaded), `LAB_SCENARIO_DIR`. No `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`/`GITHUB_STATE`/`GITHUB_STEP_SUMMARY`, and workflow commands (`::...::`) in scenario output are not honoured. Harness state lives outside `LAB_ARTIFACT_DIR`.
 
 ## How an agent uses it
 1. Pick or add a scenario (add via PR).
