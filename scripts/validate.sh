@@ -122,7 +122,6 @@ if [[ $NEEDS_JUJU == 0 ]]; then
 else
 	[[ $NEEDS_TESTS == 1 || -z $tests_ref ]] || fail "tests_ref: not used by scenario $scenario (NEEDS_TESTS=0)"
 	# Not implemented yet: these fail as setup-error rather than doing something partial.
-	[[ $substrate == lxd ]] || fail "scenario $scenario needs Juju; the $substrate substrate is not implemented yet (plan PR-4)"
 	[[ -z $ref ]] || fail "ref: build mode is not implemented yet (plan PR-5)"
 	# An explicit tests_ref runs code from that ref in the job, so it needs the
 	# ref trust check (design §8), which lands with build mode.

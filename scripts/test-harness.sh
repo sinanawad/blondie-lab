@@ -73,7 +73,7 @@ expect 2 "SUBSTRATE mismatch (lxd scenario on k8s)" lxd-only 1 "needs SUBSTRATE=
 expect 2 "NEEDS_JUJU=0 with SUBSTRATE=lxd" lxd-only 1 "NEEDS_JUJU=0 requires SUBSTRATE=any" LAB_SUBSTRATE=lxd
 expect 2 "NEEDS_JUJU=0 with DEPS" nojuju-deps 1 "NEEDS_JUJU=0 excludes"
 expect 2 "unknown DEPS word rejected at input" juju-baddeps 1 "DEPS: unknown dependency 'nonexistent'" LAB_SUBSTRATE=lxd
-expect 2 "Juju scenario on k8s (PR-4)" juju 1 "the k8s substrate is not implemented yet (plan PR-4)"
+expect 0 "Juju scenario on k8s" juju 1 "needs_juju=1 needs_tests=0 deps= juju_channel=4.0/stable"
 expect 0 "Juju scenario on lxd" juju 1 "needs_juju=1 needs_tests=0 deps= juju_channel=4.0/stable" LAB_SUBSTRATE=lxd
 expect 0 "Juju scenario with tests + DEPS on lxd" juju-tests 2 "needs_juju=1 needs_tests=1 deps=charmcraft scenario_timeout=16" LAB_SUBSTRATE=lxd
 expect 2 "ref on a Juju scenario (build mode not implemented yet)" juju 1 "build mode is not implemented" LAB_IN_REF=v4.0.14 LAB_SUBSTRATE=lxd
@@ -291,14 +291,30 @@ bypass_case 'escaped JSON (logsink.log)' '{\"password\":<redacted>,\"x\":1}' '{\
 bypass_case 'quoted multi-word value' 'password: <redacted> tail' 'password: "two words" tail'
 bypass_case 'value on the next line (|)' '    <redacted>' 'admin-secret: |' '    line one' '    line two' 'next: 1'
 bypass_case 'empty value, list on the next line' '  <redacted>' 'statepassword:' '  - deep' 'other: 1'
+bypass_case 'kubeconfig client-key-data' '    client-key-data: <redacted>' '    client-key-data: QUJDREVGRw=='
+bypass_case 'bearer token (k8s credential)' '  token: <redacted>' '  token: eyJhbGciOiJSUzI1NiJ9.abc'
+bypass_case 'non-empty authToken' 'request authToken: <redacted>' 'request authToken: "eyJhbGciOi"'
+bypass_case 'upper-case env var TOKEN=' '+ export JUJU_TOKEN=<redacted>' '+ export JUJU_TOKEN=abc'
+bypass_case 'GITHUB_TOKEN=ghs_' 'GITHUB_TOKEN=<redacted>' 'GITHUB_TOKEN=ghs_abcdefghijklmnopqrstuvwxyz0123456789'
+bypass_case '--token=' 'kubectl --token=<redacted> get pods' 'kubectl --token=abc get pods'
+bypass_case '--token <value>' 'kubectl --token <redacted> get pods' 'kubectl --token abc get pods'
+bypass_case 'access_token query string' 'https://x/?access_token=<redacted>' 'https://x/?access_token=abc'
+bypass_case 'Bearer JWT (value shape)' 'Authorization: Bearer <redacted>' 'Authorization: Bearer eyJhbGciOiJSUzI1.eyJzdWIiOiJzeXN0.sig'
+bypass_case 'bare GitHub token (value shape)' 'url https://x:<redacted>@github.com' 'url https://x:ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com'
+bypass_case 'ClientKeyData (juju k8s credential)' 'ClientKeyData: <redacted>' 'ClientKeyData: abc'
+bypass_case 'client_key_data' 'client_key_data: <redacted>' 'client_key_data: abc'
+bypass_case 'empty quotes glued to a value' 'password: <redacted>' 'password: ""secret'
 bypass_case 'macaroon-<id>= cookie' 'macaroon-abc_12-z=<redacted> Path=/' 'macaroon-abc_12-z=eyJhYmMi; Path=/'
 rm -rf "$tmp/bp" && mkdir -p "$tmp/bp" && printf '%s\n' 'admin-secret: |' '    line one' 'next: 1' >"$tmp/bp/f.txt" && scrub_run bp
 if grep -qx 'next: 1' "$tmp/bp.up/f.txt" && ! grep -q 'line one' "$tmp/bp.up/f.txt"; then pass "scrub: YAML block ends at the next key"; else bad "scrub block end"; cat "$tmp/bp.up/f.txt"; fi
 art="$tmp/clean"
 rm -rf "$art" && mkdir -p "$art"
-printf '%s\n' 'password reset requested' 'juju add-model --password-stdin' 'cert: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t' >"$art/c.txt"
+# Baseline-clean forms seen on real runs: juju's empty authToken and a charm's
+# shell-trace token= (test data).
+printf '%s\n' 'password reset requested' 'juju add-model --password-stdin' 'cert: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t' \
+	'DEBUG juju.apiserver admin.go:248 request authToken: ""' '{"message":"request authToken: \"\""}' '+ token=yeah-boi' >"$art/c.txt"
 scrub_run clean
-if sx clean scrub_hits=0 && sx clean upload_blocked=false; then pass "scrub: no key/value form, base64 certificate -> 0 hits, not blocked"; else bad "scrub clean"; cat "$art.st/scrub.env"; fi
+if sx clean scrub_hits=0 && sx clean upload_blocked=false; then pass "scrub: no key/value form, base64 certificate, empty authToken, token= -> 0 hits, not blocked"; else bad "scrub clean"; cat "$art.st/scrub.env"; fi
 art="$tmp/pk"
 rm -rf "$art" "$tmp/min" && mkdir -p "$art/keys"
 { printf -- '-----BEGIN %s PRIVATE KEY-----\n' OPENSSH; echo zz; } >"$art/keys/k.txt"
@@ -515,19 +531,215 @@ pipeline "$tmp/art-clean-stuck" "$tmp/scen" leaves-model 3 PATH="$fj:$PATH" LAB_
 check "cleanup: unfinished cleanup stops the loop -> setup-error" "$tmp/art-clean-stuck" \
 	'.verdict == "setup-error" and (.results | length) == 1 and .results[0].verdict == "pass" and (.reason | test("cleanup after iteration 1"))'
 
+# --- k8s: cleanup namespace wait, bootstrap watchdog ------------------------------
+# Fake microk8s (lab-kubectl execs `microk8s kubectl`): namespaces are lines in
+# $FAKE_NS ("name label"); `get ns NAME` decrements $FAKE_NS_DIR/NAME (calls
+# left until gone, absent = gone).
+fk="$tmp/fake-k8s"
+mkdir -p "$fk"
+cat >"$fk/microk8s" <<'FAKE'
+#!/usr/bin/env bash
+[[ $1 == kubectl ]] || exit 0
+shift
+echo "kubectl $*" >>"$FAKE_LOG"
+if [[ $1 == get && $2 == ns && $3 == -l ]]; then
+	for f in "$FAKE_NS_DIR"/*; do
+		[[ -f $f ]] || continue
+		n=${f##*/}
+		printf '{"metadata":{"name":"%s","labels":{"model.juju.is/name":"%s"}}}\n' "$n" "$(sed -n 2p "$f")"
+	done | jq -s '{items: .}'
+	exit 0
+fi
+if [[ $1 == get && $2 == ns && -n ${3:-} ]]; then
+	f="$FAKE_NS_DIR/$3"
+	[[ -f $f ]] || { echo "Error from server (NotFound): namespaces \"$3\" not found" >&2; exit 1; }
+	left=$(sed -n 1p "$f")
+	label=$(sed -n 2p "$f")
+	if [[ $left == stuck ]]; then echo "namespace/$3"; exit 0; fi
+	if ((left <= 1)); then rm -f "$f"; echo "namespace/$3"; exit 0; fi
+	printf '%s\n%s\n' $((left - 1)) "$label" >"$f"
+	echo "namespace/$3"
+	exit 0
+fi
+if [[ $1 == -n && $3 == get && $4 == pod ]]; then
+	jq -n --arg img "${FAKE_API_IMAGE:-ghcr.io/juju/jujud-operator:4.0.15}" '{status: {initContainerStatuses: [{name: "charm-init", image: $img, imageID: "ghcr.io/juju/jujud-operator@sha256:aa"}],
+		containerStatuses: [{name: "charm", image: "ghcr.io/juju/charm-base:ubuntu-24.04", imageID: "ghcr.io/juju/charm-base@sha256:bb"}, {name: "api-server", image: $img, imageID: "ghcr.io/juju/jujud-operator@sha256:aa"}]}}'
+	exit 0
+fi
+echo "fake kubectl $*"
+FAKE
+chmod +x "$fk/microk8s"
+nsd="$tmp/fake-ns"
+fakens() { rm -rf "$nsd" && mkdir -p "$nsd" && while (($#)); do printf '%s\n%s\n' "$2" "$3" >"$nsd/$1"; shift 3; done; }
+cleanup_run() { # cleanup_run <name> [VAR=value...]
+	local n=$1
+	shift
+	: >"$tmp/fake.log"
+	crc=0
+	env -i PATH="$fk:$fj:$PATH" HOME="$tmp" LAB_CONTROLLER=lab FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log" \
+		FAKE_NS_DIR="$nsd" "$@" bash scripts/cleanup-models.sh >"$tmp/$n.out" 2>&1 || crc=$?
+}
+echo m1 >"$tmp/fake.models"
+fakens m1 3 m1 suite-ns 2 suite-ns controller-lab stuck controller
+cleanup_run nsok LAB_SUBSTRATE=k8s
+if ((crc == 0)) && grep -qx 'cleanup: namespace m1 gone (NotFound)' "$tmp/nsok.out" &&
+	grep -qx 'cleanup: namespace suite-ns gone (NotFound)' "$tmp/nsok.out" &&
+	tail -n 1 "$tmp/nsok.out" | grep -qx 'cleanup: no model namespaces left' && ! grep -q 'controller-lab' "$tmp/nsok.out"; then
+	pass "cleanup k8s: waits for the destroyed model's and a labelled leftover namespace, not the controller's"
+else
+	bad "cleanup k8s namespace wait (rc $crc)"
+	cat "$tmp/nsok.out"
+fi
+echo m1 >"$tmp/fake.models"
+fakens m1 stuck m1
+cleanup_run nsstuck LAB_SUBSTRATE=k8s LAB_CLEANUP_TIMEOUT=3
+if ((crc == 1)) && grep -q 'cleanup: still present after 3s: m1' "$tmp/nsstuck.out"; then
+	pass "cleanup k8s: a namespace still there when the shared budget runs out -> exit 1"
+else
+	bad "cleanup k8s stuck namespace (rc $crc)"
+	cat "$tmp/nsstuck.out"
+fi
+echo m1 >"$tmp/fake.models"
+fakens m1 stuck m1
+cleanup_run nslxd LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
+if ((crc == 0)) && ! grep -q kubectl "$tmp/fake.log"; then pass "cleanup lxd: no namespace wait"; else bad "cleanup lxd (rc $crc)"; cat "$tmp/nslxd.out"; fi
+
+# bootstrap.sh watchdog: a hung bootstrap is dumped (k8s) before juju is killed.
+fb="$tmp/fake-boot"
+mkdir -p "$fb"
+cat >"$fb/juju" <<'FAKE'
+#!/usr/bin/env bash
+case $1 in
+clouds) echo '{"microk8s":{"type":"k8s"}}' ;;
+bootstrap) [[ -n ${FAKE_BOOT_OK:-} ]] && exit 0; echo "$$" >"$FAKE_PID"; exec sleep 60 ;;
+switch) exit 0 ;;
+show-controller) echo '{"lab":{"details":{"agent-version":"4.0.15"}}}' ;;
+esac
+FAKE
+cat >"$fb/snap" <<'FAKE'
+#!/usr/bin/env bash
+[[ -n ${FAKE_NO_SNAP:-} ]] && exit 1
+printf '%s\n' 'Interface Plug Slot Notes' 'content[microk8s] juju:peers microk8s:microk8s -'
+FAKE
+printf '#!/usr/bin/env bash\n"$@"\n' >"$fb/sudo"
+printf '#!/usr/bin/env bash\necho journal "$@"\n' >"$fb/journalctl"
+chmod +x "$fb"/*
+fakens m1 stuck m1
+for cl in microk8s localhost; do
+	b="$tmp/boot-$cl"
+	mkdir -p "$b.state"
+	brc=0
+	env -i PATH="$fb:$fk:$PATH" HOME="$tmp" LAB_CONTROLLER=lab LAB_CLOUD=$cl LAB_JUJU_SOURCE=snap LAB_BOOTSTRAP_TIMEOUT=3 LAB_ARTIFACT_DIR="$b" \
+		LAB_STATE_DIR="$b.state" FAKE_PID="$b.pid" FAKE_LOG="$tmp/fake.log" FAKE_NS_DIR="$nsd" \
+		bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
+	sleep 1
+	if ((brc == 2)) && grep -q "timed out after 3s" "$b.state/setup-error.txt" && grep -qx bootstrap_failed=1 "$b.state/juju.env" &&
+		! kill -0 "$(cat "$b.pid")" 2>/dev/null; then
+		if [[ $cl == microk8s ]]; then
+			if [[ -s $b/collect/k8s-bootstrap-timeout/get-all.txt && -s $b/collect/k8s-bootstrap-timeout/journal-microk8s.txt ]] &&
+				grep -q 'dumped to collect/k8s-bootstrap-timeout/ before teardown' "$b.out"; then
+				pass "bootstrap watchdog (microk8s): k8s state dumped, then juju killed -> setup-error"
+			else
+				bad "bootstrap watchdog: no k8s dump"
+				cat "$b.out"
+			fi
+		elif [[ ! -e $b/collect/k8s-bootstrap-timeout ]]; then
+			pass "bootstrap watchdog (localhost): juju killed -> setup-error, no k8s dump"
+		else
+			bad "bootstrap watchdog (localhost) dumped k8s"
+		fi
+	else
+		bad "bootstrap watchdog ($cl, rc $brc)"
+		cat "$b.out" "$b.state/setup-error.txt"
+	fi
+done
+# boot_ok <name> [VAR=value...]: a successful fake bootstrap on microk8s.
+boot_ok() {
+	local n=$1
+	shift
+	b="$tmp/boot-$n"
+	rm -rf "$b" "$b.state" && mkdir -p "$b.state"
+	brc=0
+	env -i PATH="$fb:$fk:$PATH" HOME="$tmp" LAB_CONTROLLER=lab LAB_CLOUD=microk8s LAB_ARTIFACT_DIR="$b" LAB_STATE_DIR="$b.state" \
+		FAKE_BOOT_OK=1 FAKE_LOG="$tmp/fake.log" FAKE_NS_DIR="$nsd" "$@" bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
+}
+boot_ok snapok LAB_JUJU_SOURCE=snap
+if ((brc == 0)) && grep -qx agent_source=packaged "$b.state/juju.env" &&
+	jq -e 'length == 3 and (map(.name) == ["charm-init", "charm", "api-server"]) and .[2].imageID == "ghcr.io/juju/jujud-operator@sha256:aa"' \
+		<<<"$(sed -n 's/^controller_images=//p' "$b.state/juju.env")" >/dev/null; then
+	pass "bootstrap k8s: controller_images recorded, api-server = default jujud-operator:<agent> -> packaged"
+else
+	bad "bootstrap k8s images (rc $brc)"
+	cat "$b.out" "$b.state/juju.env"
+fi
+boot_ok otherimg LAB_JUJU_SOURCE=snap FAKE_API_IMAGE=example.com/x/jujud-operator:4.0.15
+if ((brc == 0)) && grep -qx agent_source=unknown "$b.state/juju.env"; then pass "bootstrap k8s: other image repo -> agent_source unknown"; else bad "bootstrap k8s other repo (rc $brc)"; cat "$b.out"; fi
+boot_ok buildnosnap LAB_JUJU_SOURCE=build FAKE_NO_SNAP=1
+if ((brc == 0)) && ! grep -q 'juju:peers' "$b.out" && grep -qx agent_source=unknown "$b.state/juju.env"; then
+	pass "bootstrap k8s build mode: no juju:peers preflight (no snap), agent_source unknown"
+else
+	bad "bootstrap build-mode preflight (rc $brc)"
+	cat "$b.out"
+fi
+boot_ok snapnoplug LAB_JUJU_SOURCE=snap FAKE_NO_SNAP=1
+if ((brc == 2)) && grep -q 'juju:peers is not connected' "$b.state/setup-error.txt"; then pass "bootstrap k8s snap mode: unconnected juju:peers -> setup-error"; else bad "bootstrap snap no plug (rc $brc)"; cat "$b.out"; fi
+
+# Bootstrap step budget (design §2): LAB_BOOTSTRAP_TIMEOUT + preflight 60 +
+# timeout dump 155 + post-bootstrap 60 must fit the step's timeout-minutes.
+step=$(awk '/^      - name: /{p = ($0 ~ /name: Bootstrap$/)} p' .github/workflows/_run.yml)
+bt=$(sed -n 's/^ *LAB_BOOTSTRAP_TIMEOUT: *"*\([0-9][0-9]*\)"* *$/\1/p' <<<"$step")
+tm=$(sed -n 's/^ *timeout-minutes: *\([0-9]*\) *$/\1/p' <<<"$step")
+if [[ -n $bt && -n $tm ]] && ((bt + 60 + 155 + 60 <= tm * 60)); then
+	pass "budget: Bootstrap step LAB_BOOTSTRAP_TIMEOUT=$bt + 275 <= timeout-minutes $tm x 60"
+else
+	bad "budget: Bootstrap step LAB_BOOTSTRAP_TIMEOUT='$bt' + 275 > timeout-minutes '$tm' x 60 (or not set)"
+fi
+
+# no-models-left.sh on k8s: a labelled model namespace left behind is a fail.
+nml() { # nml <name> [VAR=value...]
+	local n=$1
+	shift
+	nrc=0
+	env -i PATH="$fk:$fj:$PATH" HOME="$tmp" LAB_CONTROLLER=lab FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log" \
+		FAKE_NS_DIR="$nsd" "$@" bash scripts/no-models-left.sh drill 3 >"$tmp/$n.out" 2>&1 || nrc=$?
+}
+: >"$tmp/fake.models"
+fakens leftover stuck leftover controller-lab stuck controller
+nml nmlstuck LAB_SUBSTRATE=k8s
+if ((nrc == 1)) && grep -qx 'drill: suite passed but model namespace(s) left after 3s: leftover' "$tmp/nmlstuck.out"; then
+	pass "no-models-left k8s: no models but a labelled namespace left -> exit 1 (fail)"
+else
+	bad "no-models-left k8s stuck (rc $nrc)"
+	cat "$tmp/nmlstuck.out"
+fi
+fakens controller-lab stuck controller
+nml nmlok LAB_SUBSTRATE=k8s
+if ((nrc == 0)) && grep -qx 'drill: teardown ok, no models or model namespaces left' "$tmp/nmlok.out"; then pass "no-models-left k8s: only the controller namespace -> ok"; else bad "no-models-left k8s ok (rc $nrc)"; cat "$tmp/nmlok.out"; fi
+fakens leftover stuck leftover
+nml nmllxd LAB_SUBSTRATE=lxd
+if ((nrc == 0)); then pass "no-models-left lxd: namespaces not checked"; else bad "no-models-left lxd (rc $nrc)"; cat "$tmp/nmllxd.out"; fi
+
+b="$tmp/boot-bad"
+mkdir -p "$b.state"
+brc=0
+env -i PATH="$fb:$PATH" LAB_CONTROLLER=lab LAB_CLOUD=aws LAB_JUJU_SOURCE=snap LAB_ARTIFACT_DIR="$b" LAB_STATE_DIR="$b.state" bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
+if ((brc == 2)) && grep -q 'LAB_CLOUD: unexpected value' "$b.state/setup-error.txt"; then pass "bootstrap: LAB_CLOUD outside localhost|microk8s -> setup-error"; else bad "bootstrap bad cloud"; fi
+
 # --- verdict.sh: juju + scrub state -> verdict.json, job outputs ----------------------
 art="$tmp/art-jujustate"
 pipeline "$art" scenarios selftest 1
 printf '%s\n' juju_version=4.0.1 juju_git_commit=0123456789abcdef0123456789abcdef01234567 juju_snap_revision=31000 source=snap \
 	substrate_snap_name=lxd substrate_snap_channel=latest/candidate substrate_snap_revision=33000 \
-	tests_sha=0123456789abcdef0123456789abcdef01234567 tests_source=git-commit >"$art.state/juju.env"
+	tests_sha=0123456789abcdef0123456789abcdef01234567 tests_source=git-commit \
+	'controller_images=[{"name":"api-server","image":"ghcr.io/juju/jujud-operator:4.0.1","imageID":"ghcr.io/juju/jujud-operator@sha256:aa"}]' >"$art.state/juju.env"
+echo 'snap_drift=microk8s rev 9064 -> 9100' >"$art.state/collect.env"
 printf '%s\n' scrub_hits=2 upload_blocked=false upload_blocked_path= >"$art.state/scrub.env"
 : >"$art.vout"
 env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd \
 	VALIDATE_OUTCOME=success READY_OUTCOME=success SCENARIO_OUTCOME=success GITHUB_OUTPUT="$art.vout" \
 	bash scripts/verdict.sh >"$tmp/log" 2>&1
 check "verdict: juju.env + scrub.env fields" "$art" \
-	'.juju_version == "4.0.1" and .juju_snap_revision == 31000 and .tests_source == "git-commit" and .substrate_snap.revision == 33000 and .scrub_hits == 2 and .upload_blocked == false and .upload_blocked_path == null'
+	'.juju_version == "4.0.1" and .juju_snap_revision == 31000 and .tests_source == "git-commit" and .substrate_snap.revision == 33000 and .scrub_hits == 2 and .upload_blocked == false and .upload_blocked_path == null and .controller_images[0].imageID == "ghcr.io/juju/jujud-operator@sha256:aa" and .snap_drift == "microk8s rev 9064 -> 9100"'
 if grep -qx 'scrub_hits=2' "$art.vout" && grep -qx 'upload_blocked=false' "$art.vout"; then pass "verdict: scrub outputs for the job result"; else bad "verdict scrub outputs"; cat "$art.vout"; fi
 art="$tmp/art-blocked"
 pipeline "$art" scenarios selftest-exit-1 1

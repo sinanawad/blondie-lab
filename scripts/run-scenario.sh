@@ -7,7 +7,9 @@
 # other than 0/1/2/3). Always exits 0: verdict.sh decides.
 #
 # With LAB_NEEDS_JUJU=1, every non-controller model is destroyed between
-# iterations (cleanup-models.sh, one 5 min budget; cleanup_s records it). A
+# iterations (cleanup-models.sh, one 5 min budget that on k8s also covers the
+# model namespaces being gone; cleanup_s records it). On k8s this script runs
+# under `sg snap_microk8s` and lab-kubectl is on the scenario's PATH. A
 # cleanup that doesn't finish stops the loop as setup-error ($LAB_STATE_DIR/stop.env).
 # suite.sh reports a matched infra signature through $LAB_SIGNAL_FILE; it is
 # accepted only with exit 2 and recorded in $LAB_STATE_DIR/infra-signature.txt.
@@ -45,6 +47,12 @@ mkdir -p "$LAB_ARTIFACT_DIR" "$LAB_STATE_DIR"
 rm -f "$LAB_STATE_DIR/stop.env" "$LAB_STATE_DIR/infra-signature.txt"
 sigdir=$(mktemp -d)
 trap 'rm -rf "$sigdir"' EXIT
+# On k8s, lab-kubectl (and nothing else from scripts/) is on the scenario's PATH.
+if [[ ${LAB_SUBSTRATE:-} == k8s ]]; then
+	mkdir -p "$sigdir/bin"
+	ln -s "$here/lab-kubectl" "$sigdir/bin/lab-kubectl"
+	PATH="$sigdir/bin:$PATH"
+fi
 
 # reap <token>: SIGKILL every process whose environment carries LAB_ITER_TOKEN=<token>.
 reap() {

@@ -4,11 +4,14 @@
 # only narrow what the calling job grants (contents: read).
 # Inputs reach the shell only through env:, never as ${{ inputs.* }} in run:.
 #
-# Steps: validate -> [LXD + juju snap + tests checkout + deps + bootstrap, for
-# NEEDS_JUJU=1] -> ready -> scenario -> collect -> scrub -> verdict -> upload
-# (full, or minimal when scrub blocks/fails) -> teardown -> job result.
-# Not implemented yet (validate.sh rejects as setup-error): the k8s substrate
-# (PR-4), ref build mode and an explicit tests_ref (PR-5, trust check).
+# Steps: validate -> [substrate (LXD or MicroK8s) + juju snap + tests checkout +
+# deps + bootstrap, for NEEDS_JUJU=1] -> ready -> scenario -> collect -> scrub ->
+# verdict -> upload (full, or minimal when scrub blocks/fails) -> teardown ->
+# job result. On k8s, every step that talks to MicroK8s or the controller runs
+# under `sg snap_microk8s -c <fixed string>` (design §4; the group is added
+# mid-job, so only a new group session sees it).
+# Not implemented yet (validate.sh rejects as setup-error): ref build mode and
+# an explicit tests_ref (PR-5, trust check).
 name: _run
 
 on:
@@ -53,6 +56,8 @@ jobs:
     env:
       LAB_SUBSTRATE: ${{ inputs.substrate }}
       LAB_CONTROLLER: lab
+      # localhost (LXD) or juju's built-in microk8s cloud (strict MicroK8s).
+      LAB_CLOUD: ${{ inputs.substrate == 'k8s' && 'microk8s' || 'localhost' }}
     steps:
       - name: Checkout blondie-lab
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,7 +85,7 @@ jobs:
       # --- Setup (NEEDS_JUJU=1 only). Every failure here is setup-error. ---
       - name: Set up LXD
         id: lxd
-        if: steps.validate.outputs.needs_juju == '1'
+        if: steps.validate.outputs.needs_juju == '1' && inputs.substrate == 'lxd'
         timeout-minutes: 10
         uses: canonical/setup-lxd@8c6a87bfb56aa48f3fb9b830baa18562d8bfd4ee # v1
         with:
@@ -89,19 +94,36 @@ jobs:
           # installed revision is recorded in verdict.substrate_snap.
           channel: 5.21/stable
 
-      # Copied from juju/juju smoke.yml, with a bound.
+      # Copied from juju/juju smoke.yml, with a bound; then records the LXD snap.
       - name: Wait for LXD
         id: lxdwait
-        if: steps.validate.outputs.needs_juju == '1'
+        if: steps.validate.outputs.needs_juju == '1' && inputs.substrate == 'lxd'
         timeout-minutes: 3
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
         run: |
           for _ in $(seq 1 18); do
-            ip link show lxdbr0 && exit 0
+            if ip link show lxdbr0; then
+              exec scripts/record-substrate.sh lxd
+            fi
             echo "Waiting for lxdbr0..."
             sleep 10
           done
           echo "lxdbr0 did not appear within 3 min"
           exit 1
+
+      # Plain snap commands, no third-party action (design §9). Before the juju
+      # snap, so juju's peers content plug connects to microk8s on install.
+      - name: Set up MicroK8s
+        id: microk8s
+        if: steps.validate.outputs.needs_juju == '1' && inputs.substrate == 'k8s'
+        timeout-minutes: 15
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          # Pinned (as juju/juju smoke.yml and norma-k8s); the installed
+          # revision is recorded in verdict.substrate_snap.
+          LAB_MICROK8S_CHANNEL: 1.34-strict/stable
+        run: scripts/setup-microk8s.sh
 
       - name: Install juju snap
         id: juju
@@ -153,7 +175,15 @@ jobs:
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
           # Copied from juju/juju smoke.yml (design §3).
           BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
-        run: scripts/bootstrap.sh
+          LAB_JUJU_SOURCE: snap
+          # bootstrap.sh's own limit; with preflight 60 s + dump 155 s +
+          # post-bootstrap 60 s it must fit timeout-minutes (test-harness.sh checks).
+          LAB_BOOTSTRAP_TIMEOUT: "900"
+        run: |
+          if [ "$LAB_SUBSTRATE" = k8s ]; then
+            exec sg snap_microk8s -c "$GITHUB_WORKSPACE/scripts/bootstrap.sh"
+          fi
+          exec scripts/bootstrap.sh
 
       # Names the failed setup step when the step itself couldn't (actions).
       - name: Record setup failure
@@ -162,7 +192,7 @@ jobs:
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           OUTCOMES: >-
-            lxd=${{ steps.lxd.outcome }} lxdwait=${{ steps.lxdwait.outcome }} juju=${{ steps.juju.outcome }}
+            lxd=${{ steps.lxd.outcome }} lxdwait=${{ steps.lxdwait.outcome }} microk8s=${{ steps.microk8s.outcome }} juju=${{ steps.juju.outcome }}
             tests=${{ steps.tests.outcome }} tests_checkout=${{ steps.tests_checkout.outcome }}
             deps=${{ steps.deps.outcome }} bootstrap=${{ steps.bootstrap.outcome }}
         run: |
@@ -192,7 +222,6 @@ jobs:
           LAB_REPEAT: ${{ steps.validate.outputs.repeat }}
           LAB_TIMEOUT_MIN: ${{ steps.validate.outputs.timeout_min }}
           LAB_NEEDS_JUJU: ${{ steps.validate.outputs.needs_juju }}
-          LAB_CLOUD: localhost
           LAB_JUJU_SOURCE: snap
           LAB_JUJU_VERSION: ${{ steps.juju.outputs.juju_version }}
           LAB_JUJU_GIT_COMMIT: ${{ steps.juju.outputs.juju_git_commit }}
@@ -201,7 +230,11 @@ jobs:
           LAB_TESTS_DIR: ${{ steps.validate.outputs.needs_tests == '1' && format('{0}/juju-tests/tests', github.workspace) || '' }}
           LAB_TESTS_SHA: ${{ steps.tests.outputs.tests_sha }}
           BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
-        run: scripts/run-scenario.sh
+        run: |
+          if [ "$LAB_SUBSTRATE" = k8s ] && [ "$LAB_NEEDS_JUJU" = 1 ]; then
+            exec sg snap_microk8s -c "$LAB_ROOT/scripts/run-scenario.sh"
+          fi
+          exec scripts/run-scenario.sh
 
       - name: Collect logs
         id: collect
@@ -214,7 +247,11 @@ jobs:
           VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
           READY_OUTCOME: ${{ steps.ready.outcome }}
           SCENARIO_OUTCOME: ${{ steps.scenario.outcome }}
-        run: scripts/collect.sh
+        run: |
+          if [ "$LAB_SUBSTRATE" = k8s ] && [ "$LAB_NEEDS_JUJU" = 1 ] && id -nG "$USER" | tr " " "\n" | grep -qx snap_microk8s; then
+            exec sg snap_microk8s -c "$GITHUB_WORKSPACE/scripts/collect.sh"
+          fi
+          exec scripts/collect.sh
 
       - name: Scrub
         id: scrub
@@ -285,7 +322,12 @@ jobs:
         timeout-minutes: 5
         run: |
           if command -v juju >/dev/null; then
-            timeout 4m juju kill-controller -t 0 --no-prompt "$LAB_CONTROLLER" || true
+            if [ "$LAB_SUBSTRATE" = k8s ] && id -nG "$USER" | tr " " "\n" | grep -qx snap_microk8s; then
+              # shellcheck disable=SC2016 # expanded by the sg shell
+              timeout 4m sg snap_microk8s -c 'juju kill-controller -t 0 --no-prompt "$LAB_CONTROLLER"' || true
+            else
+              timeout 4m juju kill-controller -t 0 --no-prompt "$LAB_CONTROLLER" || true
+            fi
           fi
 
       # Green only for pass with a clean scrub and a full upload (a redaction, a

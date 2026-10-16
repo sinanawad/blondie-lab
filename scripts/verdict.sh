@@ -32,13 +32,13 @@ if [[ -f $STATE_DIR/valid.env ]]; then
 	done <"$STATE_DIR/valid.env"
 fi
 has() { [[ -n ${val[$1]+x} ]]; }
-# Harness-written key=value state from setup (juju.env), scrub (scrub.env) and
-# the loop (stop.env); parsed, never sourced. A key seen twice (in any of them)
+# Harness-written key=value state from setup (juju.env), scrub (scrub.env),
+# collect (collect.env) and the loop (stop.env); parsed, never sourced. A key seen twice (in any of them)
 # makes the state untrustworthy: the verdict becomes error and the upload is
 # reported as blocked.
 declare -A st=()
 state_error=""
-for f in juju.env scrub.env stop.env; do
+for f in juju.env scrub.env stop.env collect.env; do
 	[[ -f $STATE_DIR/$f ]] || continue
 	while IFS= read -r line; do
 		[[ $line =~ ^([a-z_]+)=(.*)$ ]] || continue
@@ -100,6 +100,9 @@ if [[ -n $state_error ]]; then
 	verdict=error reason=$state_error
 	st[upload_blocked]=true
 fi
+# controller_images: a JSON array written by bootstrap.sh (k8s); anything else is null.
+images_json=$(jq -ce 'if type == "array" and all(.[]; type == "object") then . else null end' <<<"$(s_ controller_images)" 2>/dev/null) || images_json=null
+[[ -n $images_json ]] || images_json=null
 deps_json=$(for k in "${!st[@]}"; do if [[ $k == dep_* ]]; then printf '%s %s\n' "${k#dep_}" "${st[$k]}"; fi; done |
 	sort | jq -Rsc 'split("\n") | map(select(length > 0) | split(" ") | {name: .[0], channel: .[1], revision: (.[2] | tonumber? // null)})')
 
@@ -131,7 +134,7 @@ jq -n \
 	--arg upload_blocked "$(s_ upload_blocked)" --arg upload_blocked_path "$(s_ upload_blocked_path)" \
 	--arg scrub_dropped "$(s_ scrub_dropped)" --arg scrub_withheld "$(s_ scrub_withheld)" \
 	--arg agent "$(s_ controller_agent_version)" --arg agent_source "$(s_ agent_source)" \
-	--argjson deps "$deps_json" \
+	--argjson deps "$deps_json" --argjson images "$images_json" --arg snap_drift "$(s_ snap_drift)" \
 	--slurpfile results "$results" '
 	def v(x): if x != "" then x else null end;
 	{
@@ -142,11 +145,13 @@ jq -n \
 		juju_snap_revision: (if $juju_snap_revision == "" then null else ($juju_snap_revision | tonumber) end),
 		juju_channel: (if $no_juju then null else v($channel) end),
 		controller_agent_version: v($agent), agent_source: v($agent_source),
+		controller_images: $images,
 		source: (if $no_juju then "none" else v($source) end),
 		ref: v($ref), ref_sha: null,
 		tests_ref: v($tests_ref), tests_sha: v($tests_sha), tests_source: v($tests_source),
 		lab_sha: $lab_sha, runner_image: $runner_image,
 		deps: $deps,
+		snap_drift: v($snap_drift),
 		substrate_snap: (if $sub_name == "" then null else {name: $sub_name, channel: v($sub_channel), revision: (if $sub_rev == "" then null else ($sub_rev | tonumber) end)} end),
 		iterations: (if $repeat == "" then null else ($repeat | tonumber) end),
 		failed: ($results | map(select(.verdict == "fail")) | length),
@@ -186,6 +191,9 @@ n_done=$(jq '.results | length' "$out")
 		echo "**Upload blocked:** private key material in \`$(printf '%s' "${st[upload_blocked_path]:-?}" | tr '`' "'")\`; only verdict.json + collect.log were uploaded." && echo
 	elif [[ $scrub_ran == true && ${st[scrub_hits]:-0} != 0 ]]; then
 		echo "**Scrub:** ${st[scrub_hits]} value(s) redacted; the job is red so a human looks." && echo
+	fi
+	if [[ -n ${st[snap_drift]:-} ]]; then
+		echo "**Warning:** snap refreshed during the job despite the hold ($(printf '%s' "${st[snap_drift]}" | tr '`' "'")); recorded revisions don't describe the whole run." && echo
 	fi
 	if [[ ${st[tests_source]:-} == branch ]]; then
 		echo "**Warning:** tests/ came from the branch head \`$(printf '%s' "${st[tests_sha]:-?}" | tr '`' "'")\`, not from the binary's commit or tag; tests may not match the binary." && echo

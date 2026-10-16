@@ -8,14 +8,4 @@ set -euo pipefail
 rc=0
 "$LAB_ROOT/scripts/suite.sh" -s test_build smoke || rc=$?
 ((rc == 0)) || exit "$rc"
-deadline=$((SECONDS + 600))
-while :; do
-	left=$(timeout 60 juju models -c "$LAB_CONTROLLER" --format=json |
-		jq -r '.models // [] | .[] | select(((."is-controller") | tostring) != "true" and ."short-name" != "controller") | ."short-name"') ||
-		left="(juju models failed)"
-	[[ -z $left ]] && { echo "smoke: teardown ok, no models left"; exit 0; }
-	((SECONDS < deadline)) || break
-	sleep 10
-done
-echo "smoke: suite passed but its teardown left models after 600s: ${left//$'\n'/ }"
-exit 1
+exec "$LAB_ROOT/scripts/no-models-left.sh" smoke 600
