@@ -72,6 +72,9 @@ jobs:
           printf '%s\n' "${files[@]}"
           shellcheck -x "${files[@]}"
 
+      - name: Harness unit tests (offline)
+        run: scripts/test-harness.sh
+
       - name: Linters still fail on lint-fixtures/
         env:
           GH_TOKEN: ${{ github.token }}
