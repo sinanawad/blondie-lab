@@ -11,7 +11,11 @@
 set -euo pipefail
 export LC_ALL=C
 
-ARTIFACT_DIR=${LAB_ARTIFACT_DIR:?}
+# In the workflow this runs after scrub.sh with LAB_UPLOAD_DIR set: verdict.json
+# then goes into the scrubbed snapshot (the tree that is uploaded), and job
+# summary excerpts are read only from there, only after a completed scrub.
+# collect.sh's provisional call leaves LAB_UPLOAD_DIR unset.
+ARTIFACT_DIR=${LAB_UPLOAD_DIR:-${LAB_ARTIFACT_DIR:?}}
 STATE_DIR=${LAB_STATE_DIR:?}
 mkdir -p "$ARTIFACT_DIR" "$STATE_DIR"
 results="$STATE_DIR/results.jsonl"
@@ -29,12 +33,20 @@ if [[ -f $STATE_DIR/valid.env ]]; then
 fi
 has() { [[ -n ${val[$1]+x} ]]; }
 # Harness-written key=value state from setup (juju.env), scrub (scrub.env) and
-# the loop (stop.env); parsed, never sourced.
+# the loop (stop.env); parsed, never sourced. A key seen twice (in any of them)
+# makes the state untrustworthy: the verdict becomes error and the upload is
+# reported as blocked.
 declare -A st=()
+state_error=""
 for f in juju.env scrub.env stop.env; do
 	[[ -f $STATE_DIR/$f ]] || continue
 	while IFS= read -r line; do
-		[[ $line =~ ^([a-z_]+)=(.*)$ ]] && st[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+		[[ $line =~ ^([a-z_]+)=(.*)$ ]] || continue
+		if [[ -n ${st[${BASH_REMATCH[1]}]+x} ]]; then
+			[[ -n $state_error ]] || state_error="harness state: key ${BASH_REMATCH[1]} repeated ($f)"
+			continue
+		fi
+		st[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
 	done <"$STATE_DIR/$f"
 done
 s_() { printf '%s' "${st[$1]:-}"; }
@@ -84,6 +96,12 @@ else
 		reason="only $n_done of $repeat iterations recorded (scenario step: ${SCENARIO_OUTCOME:-unknown})"
 	fi
 fi
+if [[ -n $state_error ]]; then
+	verdict=error reason=$state_error
+	st[upload_blocked]=true
+fi
+deps_json=$(for k in "${!st[@]}"; do if [[ $k == dep_* ]]; then printf '%s %s\n' "${k#dep_}" "${st[$k]}"; fi; done |
+	sort | jq -Rsc 'split("\n") | map(select(length > 0) | split(" ") | {name: .[0], channel: .[1], revision: (.[2] | tonumber? // null)})')
 
 # Harness state goes into the artifact as written by the harness.
 cp "$results" "$ARTIFACT_DIR/results.jsonl"
@@ -111,6 +129,9 @@ jq -n \
 	--arg infra_signature "$infra_signature" \
 	--argjson scrub_ran "$scrub_ran" --arg scrub_hits "$(s_ scrub_hits)" \
 	--arg upload_blocked "$(s_ upload_blocked)" --arg upload_blocked_path "$(s_ upload_blocked_path)" \
+	--arg scrub_dropped "$(s_ scrub_dropped)" --arg scrub_withheld "$(s_ scrub_withheld)" \
+	--arg agent "$(s_ controller_agent_version)" --arg agent_source "$(s_ agent_source)" \
+	--argjson deps "$deps_json" \
 	--slurpfile results "$results" '
 	def v(x): if x != "" then x else null end;
 	{
@@ -120,10 +141,12 @@ jq -n \
 		juju_version: v($juju_version), juju_git_commit: v($juju_git_commit),
 		juju_snap_revision: (if $juju_snap_revision == "" then null else ($juju_snap_revision | tonumber) end),
 		juju_channel: (if $no_juju then null else v($channel) end),
+		controller_agent_version: v($agent), agent_source: v($agent_source),
 		source: (if $no_juju then "none" else v($source) end),
 		ref: v($ref), ref_sha: null,
 		tests_ref: v($tests_ref), tests_sha: v($tests_sha), tests_source: v($tests_source),
 		lab_sha: $lab_sha, runner_image: $runner_image,
+		deps: $deps,
 		substrate_snap: (if $sub_name == "" then null else {name: $sub_name, channel: v($sub_channel), revision: (if $sub_rev == "" then null else ($sub_rev | tonumber) end)} end),
 		iterations: (if $repeat == "" then null else ($repeat | tonumber) end),
 		failed: ($results | map(select(.verdict == "fail")) | length),
@@ -132,6 +155,8 @@ jq -n \
 		scrub_hits: (if $scrub_ran then ($scrub_hits | tonumber) else null end),
 		upload_blocked: ($upload_blocked == "true"),
 		upload_blocked_path: v($upload_blocked_path),
+		scrub_dropped: (if $scrub_dropped == "" then null else ($scrub_dropped | tonumber) end),
+		scrub_withheld: (if $scrub_withheld == "" then null else ($scrub_withheld | tonumber) end),
 		request_id: v($request_id), run_url: $run_url
 	}' >"$out"
 
@@ -162,6 +187,9 @@ n_done=$(jq '.results | length' "$out")
 	elif [[ $scrub_ran == true && ${st[scrub_hits]:-0} != 0 ]]; then
 		echo "**Scrub:** ${st[scrub_hits]} value(s) redacted; the job is red so a human looks." && echo
 	fi
+	if [[ ${st[tests_source]:-} == branch ]]; then
+		echo "**Warning:** tests/ came from the branch head \`$(printf '%s' "${st[tests_sha]:-?}" | tr '`' "'")\`, not from the binary's commit or tag; tests may not match the binary." && echo
+	fi
 	echo "Failed iterations: $n_fail/$n_done recorded (requested: ${repeat:-?})"
 	echo
 	echo '```json'
@@ -169,8 +197,18 @@ n_done=$(jq '.results | length' "$out")
 	echo '```'
 	# Design §7: show the first failing iteration, else the first non-pass one.
 	first_bad=$(jq -r '([.results[] | select(.verdict == "fail")][0] // [.results[] | select(.verdict != "pass")][0]).iteration // empty' "$out")
-	# No excerpt when the upload was blocked: the log may hold the key material.
-	if [[ -n $first_bad && -f $ARTIFACT_DIR/iteration-$first_bad.log && ${st[upload_blocked]:-} != true ]]; then
+	# Excerpts only from the scrubbed snapshot, after a completed scrub, and none
+	# when the upload was blocked (the log may hold the key material).
+	excerpt_ok=false
+	[[ -n ${LAB_UPLOAD_DIR:-} && $scrub_ran == true && ${st[upload_blocked]:-} == false ]] && excerpt_ok=true
+	if [[ $excerpt_ok == true && ${st[bootstrap_failed]:-} == 1 && -f $ARTIFACT_DIR/collect/bootstrap.log ]]; then
+		echo
+		echo "Last 30 lines of collect/bootstrap.log (scrubbed):"
+		echo '```'
+		tail -n 30 "$ARTIFACT_DIR/collect/bootstrap.log" | tr '`' "'"
+		echo '```'
+	fi
+	if [[ $excerpt_ok == true && -n $first_bad && -f $ARTIFACT_DIR/iteration-$first_bad.log ]]; then
 		echo
 		echo "Last 50 lines of iteration $first_bad:"
 		echo '```'

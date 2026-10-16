@@ -1,0 +1,4 @@
+# DEPS vocabulary (scenario.env DEPS=...), read by validate.sh (rejects unknown
+# words at input time) and deps.sh (installs them). One word per line:
+#   <name> <snap channel>   (channel and revision are recorded in verdict.json)
+charmcraft 4.x/stable

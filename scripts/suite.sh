@@ -7,7 +7,14 @@
 #   in scripts/infra-signatures.txt. The matched line goes to $LAB_SIGNAL_FILE
 #   for run-scenario.sh to record as infra_signature. After a test started,
 #   exit 1 stays fail.
-# - main.sh's work dir (tests/tmp.*, kept on failure) is copied into the artifact.
+# - Every other outcome is normalised to the lab exit-code contract, because
+#   main.sh (bash -e) exits with whatever the failing command returned (juju
+#   exits 2 on usage errors and client panics, and passes remote codes through):
+#   0 with at least one "] Success: " line -> 0; 0 without one -> 3 (no test
+#   ran, inconclusive); a signal (>= 128) stays as is (error); anything else
+#   -> 1 (fail), including 2 and 3.
+# - main.sh's work dir (tests/tmp.*, kept on failure) is copied into the
+#   artifact; scrub.sh enforces the never-collect list and drops symlinks.
 set -euo pipefail
 export LC_ALL=C
 
@@ -45,4 +52,12 @@ if ((rc == 1)); then
 		fi
 	fi
 fi
-exit "$rc"
+if ((rc == 0)); then
+	# Unanchored: run() starts the line with \r\e[1A\e[0K.
+	if grep -q '\] Success: ' "$out"; then exit 0; fi
+	echo "suite.sh: main.sh exit 0 but no test ran (no '] Success:' line) -> 3 (inconclusive)"
+	exit 3
+fi
+((rc >= 128)) && exit "$rc"
+((rc == 1)) || echo "suite.sh: main.sh exit $rc -> 1 (fail)"
+exit 1

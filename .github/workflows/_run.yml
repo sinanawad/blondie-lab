@@ -59,7 +59,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # LAB_ARTIFACT_DIR (uploaded, scenario-writable) and LAB_STATE_DIR (harness
+      # LAB_ARTIFACT_DIR (scenario-writable; scrub.sh snapshots it into
+      # LAB_UPLOAD_DIR, the only tree uploaded) and LAB_STATE_DIR (harness
       # state: valid.env, validate-error.txt, setup-error.txt, juju.env,
       # results.jsonl, scrub.env) are set per step from runner.temp, never
       # through $GITHUB_ENV.
@@ -82,6 +83,25 @@ jobs:
         if: steps.validate.outputs.needs_juju == '1'
         timeout-minutes: 10
         uses: canonical/setup-lxd@8c6a87bfb56aa48f3fb9b830baa18562d8bfd4ee # v1
+        with:
+          # Stable LTS track, not the action's latest/candidate default: a
+          # pre-release channel moves between runs (and mid-sweep). The
+          # installed revision is recorded in verdict.substrate_snap.
+          channel: 5.21/stable
+
+      # Copied from juju/juju smoke.yml, with a bound.
+      - name: Wait for LXD
+        id: lxdwait
+        if: steps.validate.outputs.needs_juju == '1'
+        timeout-minutes: 3
+        run: |
+          for _ in $(seq 1 18); do
+            ip link show lxdbr0 && exit 0
+            echo "Waiting for lxdbr0..."
+            sleep 10
+          done
+          echo "lxdbr0 did not appear within 3 min"
+          exit 1
 
       - name: Install juju snap
         id: juju
@@ -142,7 +162,7 @@ jobs:
         env:
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           OUTCOMES: >-
-            lxd=${{ steps.lxd.outcome }} juju=${{ steps.juju.outcome }}
+            lxd=${{ steps.lxd.outcome }} lxdwait=${{ steps.lxdwait.outcome }} juju=${{ steps.juju.outcome }}
             tests=${{ steps.tests.outcome }} tests_checkout=${{ steps.tests_checkout.outcome }}
             deps=${{ steps.deps.outcome }} bootstrap=${{ steps.bootstrap.outcome }}
         run: |
@@ -202,6 +222,7 @@ jobs:
         timeout-minutes: 3
         env:
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_UPLOAD_DIR: ${{ runner.temp }}/lab-upload
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
         run: scripts/scrub.sh
 
@@ -211,32 +232,37 @@ jobs:
         timeout-minutes: 2
         env:
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_UPLOAD_DIR: ${{ runner.temp }}/lab-upload
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
           READY_OUTCOME: ${{ steps.ready.outcome }}
           SCENARIO_OUTCOME: ${{ steps.scenario.outcome }}
         run: scripts/verdict.sh
 
-      # Full upload only when scrub succeeded and found no private key; every
-      # other outcome (blocked, failed, timed out, skipped) uploads only
-      # verdict.json + collect.log, so scrub fails closed. Exactly one artifact
-      # per run either way. The fallback name keeps logs if verdict.sh died.
+      # Full upload (the scrubbed snapshot, never the live dir) only when scrub
+      # succeeded, found no private key and verdict.sh agrees; every other
+      # outcome (blocked, failed, timed out, skipped), and a failed full upload,
+      # uploads only verdict.json + collect.log, so scrub fails closed. Exactly
+      # one artifact per run either way. The fallback name keeps logs if
+      # verdict.sh died.
       - name: Upload artifact
-        if: always() && steps.scrub.outcome == 'success' && steps.scrub.outputs.upload_blocked == 'false'
+        id: upload
+        if: always() && steps.scrub.outcome == 'success' && steps.scrub.outputs.upload_blocked == 'false' && steps.verdict.outputs.upload_blocked == 'false'
         timeout-minutes: 3
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.verdict.outputs.artifact_name || format('lab-logs-invalid-{0}', github.run_id) }}
-          path: ${{ runner.temp }}/lab-artifacts
+          path: ${{ runner.temp }}/lab-upload
           retention-days: 7
           if-no-files-found: error
 
       - name: Stage minimal artifact
         id: minimal
-        if: always() && !(steps.scrub.outcome == 'success' && steps.scrub.outputs.upload_blocked == 'false')
+        if: always() && (!(steps.scrub.outcome == 'success' && steps.scrub.outputs.upload_blocked == 'false' && steps.verdict.outputs.upload_blocked == 'false') || steps.upload.outcome == 'failure')
         timeout-minutes: 1
         env:
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_UPLOAD_DIR: ${{ runner.temp }}/lab-upload
           LAB_MINIMAL_DIR: ${{ runner.temp }}/lab-minimal
         run: scripts/minimal-artifact.sh
 
@@ -249,6 +275,8 @@ jobs:
           path: ${{ runner.temp }}/lab-minimal
           retention-days: 7
           if-no-files-found: error
+          # Replaces a partial artifact left by a failed full upload.
+          overwrite: true
 
       # Best effort, never affects the verdict (design §7); the VM is discarded anyway.
       - name: Teardown
@@ -260,8 +288,9 @@ jobs:
             timeout 4m juju kill-controller -t 0 --no-prompt "$LAB_CONTROLLER" || true
           fi
 
-      # Green only for pass with a clean scrub (a redaction or a blocked upload
-      # turns the job red so a human looks; verdict.json keeps the real verdict).
+      # Green only for pass with a clean scrub and a full upload (a redaction, a
+      # blocked or failed upload turns the job red so a human looks;
+      # verdict.json keeps the real verdict).
       - name: Job result
         if: always()
         timeout-minutes: 1
@@ -269,6 +298,7 @@ jobs:
           VERDICT: ${{ steps.verdict.outputs.verdict }}
           SCRUB_HITS: ${{ steps.verdict.outputs.scrub_hits }}
           UPLOAD_BLOCKED: ${{ steps.verdict.outputs.upload_blocked }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
         run: |
-          echo "verdict: ${VERDICT:-missing}, scrub_hits: ${SCRUB_HITS:-missing}, upload_blocked: ${UPLOAD_BLOCKED:-missing}"
-          [ "${VERDICT:-}" = pass ] && [ "${SCRUB_HITS:-}" = 0 ] && [ "${UPLOAD_BLOCKED:-}" = false ]
+          echo "verdict: ${VERDICT:-missing}, scrub_hits: ${SCRUB_HITS:-missing}, upload_blocked: ${UPLOAD_BLOCKED:-missing}, upload: ${UPLOAD_OUTCOME:-missing}"
+          [ "${VERDICT:-}" = pass ] && [ "${SCRUB_HITS:-}" = 0 ] && [ "${UPLOAD_BLOCKED:-}" = false ] && [ "${UPLOAD_OUTCOME:-}" = success ]

@@ -14,13 +14,19 @@ sha="" src=""
 if [[ -n $git_commit ]]; then
 	sha=$git_commit src=git-commit
 else
-	if sha=$(timeout 60 gh api "repos/juju/juju/commits/v$version" --jq .sha 2>/dev/null) && [[ $sha =~ ^[0-9a-f]{40}$ ]]; then
+	[[ $version =~ ^[0-9]+\.[0-9]+[.0-9A-Za-z-]*$ ]] || setup_fail "no git-commit and an unusable version '$version'"
+	# Only HTTP 404 means "no such tag"; any other API failure (rate limit, 5xx,
+	# timeout) fails closed instead of silently switching the tests tree.
+	err=$(mktemp)
+	if sha=$(timeout 60 gh api "repos/juju/juju/commits/v$version" --jq .sha 2>"$err") && [[ $sha =~ ^[0-9a-f]{40}$ ]]; then
 		src=tag
-	else
-		track=$(grep -oE '^[0-9]+\.[0-9]+' <<<"$version") || setup_fail "no git-commit and no track in version '$version'"
-		sha=$(timeout 60 gh api "repos/juju/juju/commits/$track" --jq .sha 2>/dev/null) || setup_fail "could not resolve tests ref (no git-commit, no tag v$version, branch $track failed)"
+	elif grep -q 'HTTP 404' "$err"; then
+		track=$(grep -oE '^[0-9]+\.[0-9]+' <<<"$version")
+		sha=$(timeout 60 gh api "repos/juju/juju/commits/$track" --jq .sha 2>/dev/null) || setup_fail "could not resolve tests ref (API error on branch $track)"
 		src=branch
 		echo "::warning::tests/ taken from the $track branch head ($sha): the snap has no git-commit and tag v$version doesn't exist, so tests may not match the binary"
+	else
+		setup_fail "could not resolve tests ref (API error on tag v$version)"
 	fi
 fi
 [[ $sha =~ ^[0-9a-f]{40}$ ]] || setup_fail "resolved tests_sha '$sha' is not a SHA"

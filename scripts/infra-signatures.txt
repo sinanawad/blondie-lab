@@ -5,5 +5,9 @@
 #
 # tests/includes/check.sh check_dependencies():
 ^Missing dependencies: 
-# tests/includes/juju.sh bootstrap() on a reused controller with a leftover model:
+# tests/includes/juju.sh bootstrap() on a reused controller with a leftover model.
+# Iteration 1 starts on a fresh controller and later ones only after
+# cleanup-models.sh saw no models, so a hit here means juju listed a model that
+# cleanup had seen destroyed, or the scenario created it itself. Triage it as a
+# possible juju bug, don't discount it.
 ^[^ ]+ already exists\. Use the following to clean up the environment:$

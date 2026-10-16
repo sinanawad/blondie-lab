@@ -127,7 +127,12 @@ else
 	# An explicit tests_ref runs code from that ref in the job, so it needs the
 	# ref trust check (design §8), which lands with build mode.
 	[[ -z $tests_ref ]] || fail "tests_ref: an explicit tests_ref needs the ref trust check (plan PR-5); omit it to use the snap's git-commit"
-	# DEPS words are checked against the deps.sh vocabulary during setup (exit 2 there).
+	# DEPS words must be in the vocabulary deps.sh installs from (fail in seconds,
+	# not after the LXD and juju setup).
+	for d in $DEPS; do
+		awk -v d="$d" '$1 == d { f = 1 } END { exit !f }' "$(dirname "$0")/deps-vocab.txt" ||
+			fail "scenario.env: DEPS: unknown dependency '$d' (vocabulary: scripts/deps-vocab.txt)"
+	done
 fi
 
 {

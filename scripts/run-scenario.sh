@@ -15,6 +15,11 @@
 # Isolation: the scenario gets no GITHUB_ENV/OUTPUT/PATH/STATE/STEP_SUMMARY and no
 # LAB_STATE_DIR, and its output is replayed into the step log between
 # ::stop-commands:: markers, so it can't issue workflow commands.
+# The step log is public and outlives the artifact, so the replay goes through
+# scripts/redact.pl (the scrub's rules) and is withheld entirely when the log
+# holds private key material. After each iteration, every process still
+# carrying that iteration's LAB_ITER_TOKEN is killed, so nothing keeps writing
+# into the artifact dir (scrub.sh also works on a snapshot).
 # (Same OS user, so this is integrity against accidents and naive output, not a
 # sandbox.)
 set -euo pipefail
@@ -41,6 +46,25 @@ rm -f "$LAB_STATE_DIR/stop.env" "$LAB_STATE_DIR/infra-signature.txt"
 sigdir=$(mktemp -d)
 trap 'rm -rf "$sigdir"' EXIT
 
+# reap <token>: SIGKILL every process whose environment carries LAB_ITER_TOKEN=<token>.
+reap() {
+	local tok=$1 n=0 found p pid
+	for _ in 1 2 3 4 5; do
+		found=0
+		for p in /proc/[0-9]*; do
+			pid=${p#/proc/}
+			[[ $pid == "$$" || $pid == "$BASHPID" ]] && continue
+			if tr '\0' '\n' 2>/dev/null <"$p/environ" | grep -qxF "LAB_ITER_TOKEN=$tok"; then
+				kill -KILL "$pid" 2>/dev/null && found=$((found + 1))
+			fi
+		done
+		n=$((n + found))
+		((found == 0)) && break
+		sleep 1
+	done
+	echo "$n"
+}
+
 verdict_of() {
 	case $1 in
 	0) echo pass ;;
@@ -57,15 +81,24 @@ for ((i = 1; i <= LAB_REPEAT; i++)); do
 	start=$(date +%s)
 	rc=0
 	sig="$sigdir/signal-$i"
+	itok=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 	env -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
-		-u LAB_STATE_DIR LAB_ITERATION="$i" LAB_SCENARIO_DIR="$dir" LAB_SIGNAL_FILE="$sig" \
+		-u LAB_STATE_DIR LAB_ITERATION="$i" LAB_SCENARIO_DIR="$dir" LAB_SIGNAL_FILE="$sig" LAB_ITER_TOKEN="$itok" \
 		timeout -k "$kill_grace" "$iter_timeout" bash "$dir/run.sh" >"$log" 2>&1 </dev/null || rc=$?
 	duration=$(($(date +%s) - start))
+	reaped=$(reap "$itok")
 	tok=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 	echo "::stop-commands::$tok"
-	cat "$log"
+	pk=0
+	"$here/redact.pl" --pk "$log" || pk=$?
+	if ((pk != 1)); then
+		echo "iteration $i log withheld from the step log (private key material, or unreadable)"
+	else
+		"$here/redact.pl" <"$log" || echo "iteration $i: redaction failed; rest of the log withheld"
+	fi
 	echo "::$tok::"
 	echo "::endgroup::"
+	((reaped == 0)) || echo "iteration $i: killed $reaped leftover process(es)"
 	v=$(verdict_of "$rc")
 	if [[ $rc == 2 && -s $sig && ! -s $LAB_STATE_DIR/infra-signature.txt ]]; then
 		head -n 1 "$sig" | cut -c1-500 >"$LAB_STATE_DIR/infra-signature.txt"

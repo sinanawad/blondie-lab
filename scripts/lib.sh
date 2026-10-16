@@ -12,9 +12,11 @@ setup_fail() {
 }
 
 # state_set <key> <value>: append to $LAB_STATE_DIR/juju.env (parsed by
-# verdict.sh, never sourced). Values must be single-line.
+# verdict.sh, never sourced). Values must be single-line; each key is written
+# once (verdict.sh rejects a state file with a repeated key).
 state_set() {
 	[[ $1 =~ ^[a-z_]+$ && $2 != *$'\n'* ]] || setup_fail "state_set: bad key or value for $1"
+	! grep -q "^$1=" "${LAB_STATE_DIR:?}/juju.env" 2>/dev/null || setup_fail "state_set: $1 already set"
 	printf '%s=%s\n' "$1" "$2" >>"${LAB_STATE_DIR:?}/juju.env"
 }
 

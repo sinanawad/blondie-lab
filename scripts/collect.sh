@@ -38,11 +38,11 @@ fi
 if command -v juju >/dev/null && [[ -n $controller ]] && timeout 30 juju show-controller "$controller" >/dev/null 2>&1; then
 	c 60 juju/version.txt juju version --all
 	c 60 juju/show-controller.yaml juju show-controller "$controller"
-	c 60 juju/controller-config.yaml juju controller-config -c "$controller"
+	c 60 juju/controller-config.yaml juju controller-config -c "$controller" --format=yaml
 	models=$(timeout 60 juju models -c "$controller" --format=json 2>>"$LOG" | jq -r '.models // [] | .[] | ."short-name"' 2>>"$LOG")
 	for m in $models; do
 		[[ $m =~ ^[A-Za-z0-9._-]+$ ]] || { echo "skipping odd model name" >>"$LOG"; continue; }
-		c 60 "juju/$m/model-config.yaml" juju model-config -m "$controller:$m"
+		c 60 "juju/$m/model-config.yaml" juju model-config -m "$controller:$m" --format=yaml
 		c 60 "juju/$m/status.yaml" juju status -m "$controller:$m" --format=yaml --relations --storage
 		# debug-log capped at 20 MB per model.
 		timeout 120 juju debug-log -m "$controller:$m" --replay --no-tail 2>&1 | head -c 20M >"$C/juju/$m/debug-log.txt"
