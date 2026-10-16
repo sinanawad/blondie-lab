@@ -436,6 +436,25 @@ suite_case() {
 		cat "$tmp/log"
 	fi
 }
+# TMPDIR for the suite: inside the tests checkout, not /tmp (snap juju can't read /tmp).
+td="$tmp/tests-tmpdir"
+mkdir -p "$td"
+cat >"$td/main.sh" <<'FAKE'
+#!/usr/bin/env bash
+echo "$TMPDIR" >"$TMPDIR_OUT"
+echo '===> [   ] Running: x'
+echo '===> [ ok ] Success: x'
+FAKE
+chmod +x "$td/main.sh"
+rc=0
+env -i PATH="$stub:$PATH" LAB_TESTS_DIR="$td" LAB_CONTROLLER=lab LAB_ARTIFACT_DIR="$tmp/art-tmpdir" LAB_ITERATION=1 TMPDIR_OUT="$tmp/tmpdir.out" \
+	bash scripts/suite.sh smoke >"$tmp/log" 2>&1 || rc=$?
+if ((rc == 0)) && [[ $(cat "$tmp/tmpdir.out") == "$td/lab-tmp" && -d $td/lab-tmp ]]; then
+	pass "suite.sh: TMPDIR is <tests>/lab-tmp (snap juju can read it), not /tmp"
+else
+	bad "suite.sh TMPDIR (rc $rc): $(cat "$tmp/tmpdir.out" 2>/dev/null)"
+	cat "$tmp/log"
+fi
 suite_case depmiss 2 'Missing dependencies: yq'
 suite_case leftover 2 "$SIG_DUP"
 suite_case intest 1 ''
