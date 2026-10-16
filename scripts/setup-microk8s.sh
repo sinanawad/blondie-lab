@@ -16,6 +16,7 @@ channel=${LAB_MICROK8S_CHANNEL:?}
 timeout 300 sudo snap install microk8s --channel="$channel" || setup_fail "snap install microk8s --channel=$channel failed"
 tracking=$(snap info microk8s | sed -n 's/^tracking: *//p')
 [[ $tracking == "$channel" ]] || setup_fail "microk8s snap tracks '$tracking', requested '$channel'"
+hold_refresh microk8s
 sudo usermod -a -G snap_microk8s "$USER" || setup_fail "usermod -a -G snap_microk8s failed"
 timeout 300 sudo microk8s status --wait-ready --timeout 280 >/dev/null || setup_fail "microk8s did not become ready within 5 min"
 for a in dns hostpath-storage rbac; do

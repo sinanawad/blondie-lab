@@ -5,8 +5,9 @@
 # is best effort, under timeout, logged to collect.log. Never collected:
 # accounts.yaml, agent.conf, *.key, kubeconfigs, /var/lib/juju.
 # On k8s (LAB_SUBSTRATE=k8s) the step runs under `sg snap_microk8s` and adds
-# collect/k8s/ (scripts/k8s-dump.sh); it runs before Teardown, so a failed or
-# timed-out bootstrap is dumped while its pods still exist.
+# collect/k8s/ (scripts/k8s-dump.sh, capped at 240 s, before the juju section);
+# it runs before Teardown, so a failed or timed-out bootstrap is dumped while
+# its pods still exist. Also compares the snap revisions with the recorded ones.
 set -uo pipefail
 export LC_ALL=C
 
@@ -38,6 +39,33 @@ if [[ ${LAB_NEEDS_JUJU:-0} != 1 ]]; then
 	exit 0
 fi
 
+# Snaps refreshed mid-job despite the hold (setup-juju.sh, the substrate step):
+# the recorded revision no longer describes the run. Reported in
+# $LAB_STATE_DIR/collect.env (verdict.snap_drift + a summary warning).
+if [[ -n ${LAB_STATE_DIR:-} && -f $LAB_STATE_DIR/juju.env ]]; then
+	drift=""
+	rec() { sed -n "s/^$1=//p" "$LAB_STATE_DIR/juju.env" | tail -n 1; }
+	sub=$(rec substrate_snap_name)
+	for pair in "juju $(rec juju_snap_revision)" "${sub:-} $(rec substrate_snap_revision)"; do
+		read -r snapn want <<<"$pair"
+		[[ -n ${snapn:-} && -n ${want:-} ]] || continue
+		now=$(timeout 30 snap list "$snapn" 2>/dev/null | awk 'NR == 2 {print $3}')
+		[[ $now == "$want" ]] || drift+="${drift:+, }$snapn rev $want -> ${now:-?}"
+	done
+	printf 'snap_drift=%s\n' "$drift" >"$LAB_STATE_DIR/collect.env"
+	echo "snap revisions: ${drift:-unchanged}" >>"$LOG"
+fi
+
+# k8s first: if the controller is wedged, the juju commands below can use up
+# the step before the pod/event/journal state that explains it is dumped.
+if [[ ${LAB_SUBSTRATE:-} == k8s ]]; then
+	if command -v microk8s >/dev/null; then
+		timeout -k 5 240 "$here/k8s-dump.sh" "$C/k8s" "$LOG" || echo "k8s dump cut at 240s" >>"$LOG"
+	else
+		echo "microk8s not installed; skipping k8s collection" >>"$LOG"
+	fi
+fi
+
 if command -v juju >/dev/null && [[ -n $controller ]] && timeout 30 juju show-controller "$controller" >/dev/null 2>&1; then
 	c 60 juju/version.txt juju version --all
 	c 60 juju/show-controller.yaml juju show-controller "$controller"
@@ -53,14 +81,6 @@ if command -v juju >/dev/null && [[ -n $controller ]] && timeout 30 juju show-co
 	done
 else
 	echo "juju or controller '$controller' not available; skipping juju collection" >>"$LOG"
-fi
-
-if [[ ${LAB_SUBSTRATE:-} == k8s ]]; then
-	if command -v microk8s >/dev/null; then
-		"$here/k8s-dump.sh" "$C/k8s" "$LOG"
-	else
-		echo "microk8s not installed; skipping k8s collection" >>"$LOG"
-	fi
 fi
 
 if [[ ${LAB_SUBSTRATE:-} == lxd ]] && command -v lxc >/dev/null; then

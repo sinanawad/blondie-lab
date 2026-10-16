@@ -15,6 +15,7 @@ OUT=${GITHUB_OUTPUT:-/dev/stdout}
 timeout 300 sudo snap install juju --channel="$channel" || setup_fail "snap install juju --channel=$channel failed"
 tracking=$(snap info juju | sed -n 's/^tracking: *//p')
 [[ $tracking == "$channel" ]] || setup_fail "juju snap tracks '$tracking', requested '$channel'"
+hold_refresh juju
 rev=$(snap list juju | awk 'NR == 2 {print $3}')
 # Juju's strictly confined snap keeps its data here.
 mkdir -p "$HOME/.local/share/juju"
