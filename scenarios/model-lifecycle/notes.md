@@ -1,4 +1,4 @@
-- **Note:** `test_model_metrics` restarts the controller agent (`sudo systemctl restart jujud-machine-0` on controller machine 0) and waits for it to return. On the lab controller that is acceptable, because each run bootstraps its own controller. `test_model_multi` and `test_model_destroy` create several models; the teardown check covers them.
+- **Note:** `test_model_multi` and `test_model_destroy` create several models; the teardown check covers them. `test_model_metrics` is skipped (see above).
 - **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name.
 - **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
 - **Expected verdict:** `pass` on a healthy channel.

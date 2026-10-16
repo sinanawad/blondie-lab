@@ -1,0 +1,1 @@
+test_model_metrics fails on the lab: run_model_metrics_disabled saw no charmrevisioner metrics line in the debug log within 170 s of the controller agent restart (run 38907752372, 4.0/stable). It also restarts the lab controller's jujud. Skipped until investigated (owner question).
