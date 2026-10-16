@@ -10,7 +10,10 @@ if timeout 60 juju show-model "$c:bob/m1" >/dev/null 2>&1; then
 fi
 # add-user prints a registration token: never let it reach the log.
 timeout 60 juju show-user -c "$c" bob >/dev/null 2>&1 || timeout 60 juju add-user -c "$c" bob >/dev/null 2>&1
-timeout 300 juju add-model -c "$c" m1 --owner bob --no-switch >/dev/null
+# bob has no credential: the controller looks for <cloud>/bob/<name>. The
+# local admin credential (named as the cloud, localhost or microk8s) is
+# uploaded as bob's.
+timeout 300 juju add-model -c "$c" m1 --owner bob --credential "${LAB_CLOUD:?}" --no-switch >/dev/null
 timeout 60 juju models --all -c "$c" --format=json | jq -r '.models[] | "drill: model \(.name) short-name=\(."short-name")"'
 if [[ ${LAB_SUBSTRATE:-} == k8s ]]; then
 	timeout 60 "$LAB_ROOT/scripts/lab-kubectl" get ns -L model.juju.is/name | sed 's/^/drill: ns /'
