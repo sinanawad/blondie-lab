@@ -124,9 +124,12 @@ jobs:
           df -h | tee "$LAB_ARTIFACT_DIR/collect/df-after-free.txt"
 
       # --- Setup (NEEDS_JUJU=1 only). Every failure here is setup-error. ---
+      # Also on k8s when DEPS has charmcraft: charmcraft packs charms in an LXD
+      # instance (sidecar test_rootless; without it "user must be manually added
+      # to 'lxd' group"). The LXD-substrate steps below stay LXD-only.
       - name: Set up LXD
         id: lxd
-        if: steps.validate.outputs.needs_juju == '1' && inputs.substrate == 'lxd'
+        if: steps.validate.outputs.needs_juju == '1' && (inputs.substrate == 'lxd' || contains(format(' {0} ', steps.validate.outputs.deps), ' charmcraft '))
         timeout-minutes: 10
         uses: canonical/setup-lxd@8c6a87bfb56aa48f3fb9b830baa18562d8bfd4ee # v1
         with:
