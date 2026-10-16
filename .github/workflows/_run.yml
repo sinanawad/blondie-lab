@@ -4,10 +4,11 @@
 # only narrow what the calling job grants (contents: read).
 # Inputs reach the shell only through env:, never as ${{ inputs.* }} in run:.
 #
-# PR-2 scope: validate -> ready -> scenario -> verdict -> upload. Substrate setup,
-# bootstrap, collect.sh and scrub land in PR-3/PR-4; until then validate.sh
-# rejects scenarios with NEEDS_JUJU=1, ref (build mode), DEPS and NEEDS_TESTS=1
-# as setup-error.
+# Steps: validate -> [LXD + juju snap + tests checkout + deps + bootstrap, for
+# NEEDS_JUJU=1] -> ready -> scenario -> collect -> scrub -> verdict -> upload
+# (full, or minimal when scrub blocks/fails) -> teardown -> job result.
+# Not implemented yet (validate.sh rejects as setup-error): the k8s substrate
+# (PR-4), ref build mode and an explicit tests_ref (PR-5, trust check).
 name: _run
 
 on:
@@ -51,15 +52,18 @@ jobs:
       contents: read
     env:
       LAB_SUBSTRATE: ${{ inputs.substrate }}
+      LAB_CONTROLLER: lab
     steps:
       - name: Checkout blondie-lab
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # LAB_ARTIFACT_DIR (uploaded, scenario-writable) and LAB_STATE_DIR (harness
-      # state: valid.env, validate-error.txt, results.jsonl) are set per step from
-      # runner.temp, never through $GITHUB_ENV.
+      # LAB_ARTIFACT_DIR (scenario-writable; scrub.sh snapshots it into
+      # LAB_UPLOAD_DIR, the only tree uploaded) and LAB_STATE_DIR (harness
+      # state: valid.env, validate-error.txt, setup-error.txt, juju.env,
+      # results.jsonl, scrub.env) are set per step from runner.temp, never
+      # through $GITHUB_ENV.
       - name: Validate inputs
         id: validate
         timeout-minutes: 3
@@ -73,7 +77,102 @@ jobs:
           LAB_IN_REQUEST_ID: ${{ inputs.request_id }}
         run: scripts/validate.sh
 
-      # PR-3/PR-4: substrate setup and bootstrap steps go here, above "ready".
+      # --- Setup (NEEDS_JUJU=1 only). Every failure here is setup-error. ---
+      - name: Set up LXD
+        id: lxd
+        if: steps.validate.outputs.needs_juju == '1'
+        timeout-minutes: 10
+        uses: canonical/setup-lxd@8c6a87bfb56aa48f3fb9b830baa18562d8bfd4ee # v1
+        with:
+          # Stable LTS track, not the action's latest/candidate default: a
+          # pre-release channel moves between runs (and mid-sweep). The
+          # installed revision is recorded in verdict.substrate_snap.
+          channel: 5.21/stable
+
+      # Copied from juju/juju smoke.yml, with a bound.
+      - name: Wait for LXD
+        id: lxdwait
+        if: steps.validate.outputs.needs_juju == '1'
+        timeout-minutes: 3
+        run: |
+          for _ in $(seq 1 18); do
+            ip link show lxdbr0 && exit 0
+            echo "Waiting for lxdbr0..."
+            sleep 10
+          done
+          echo "lxdbr0 did not appear within 3 min"
+          exit 1
+
+      - name: Install juju snap
+        id: juju
+        if: steps.validate.outputs.needs_juju == '1'
+        timeout-minutes: 5
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_JUJU_CHANNEL: ${{ steps.validate.outputs.juju_channel }}
+        run: scripts/setup-juju.sh
+
+      - name: Resolve tests ref
+        id: tests
+        if: steps.validate.outputs.needs_tests == '1'
+        timeout-minutes: 2
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/resolve-tests.sh
+
+      - name: Checkout juju/juju tests
+        id: tests_checkout
+        if: steps.validate.outputs.needs_tests == '1'
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: juju/juju
+          ref: ${{ steps.tests.outputs.tests_sha }}
+          path: juju-tests
+          sparse-checkout: tests
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Dependencies
+        id: deps
+        if: steps.validate.outputs.needs_juju == '1'
+        timeout-minutes: 10
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_DEPS: ${{ steps.validate.outputs.deps }}
+          LAB_NEEDS_TESTS: ${{ steps.validate.outputs.needs_tests }}
+        run: scripts/deps.sh
+
+      - name: Bootstrap
+        id: bootstrap
+        if: steps.validate.outputs.needs_juju == '1'
+        timeout-minutes: 20
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          # Copied from juju/juju smoke.yml (design §3).
+          BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
+        run: scripts/bootstrap.sh
+
+      # Names the failed setup step when the step itself couldn't (actions).
+      - name: Record setup failure
+        if: failure() && steps.validate.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          OUTCOMES: >-
+            lxd=${{ steps.lxd.outcome }} lxdwait=${{ steps.lxdwait.outcome }} juju=${{ steps.juju.outcome }}
+            tests=${{ steps.tests.outcome }} tests_checkout=${{ steps.tests_checkout.outcome }}
+            deps=${{ steps.deps.outcome }} bootstrap=${{ steps.bootstrap.outcome }}
+        run: |
+          mkdir -p "$LAB_STATE_DIR"
+          if [ ! -s "$LAB_STATE_DIR/setup-error.txt" ]; then
+            read -r -a kv <<<"$OUTCOMES"
+            failed=$(printf '%s\n' "${kv[@]}" | sed -n 's/=failure$//p' | head -n 1)
+            echo "setup step '${failed:-unknown}' failed" >"$LAB_STATE_DIR/setup-error.txt"
+          fi
+          cat "$LAB_STATE_DIR/setup-error.txt"
 
       # Marker: success only if every step above succeeded (implicit success()).
       # verdict.sh maps anything else to setup-error.
@@ -86,12 +185,46 @@ jobs:
         id: scenario
         timeout-minutes: ${{ fromJSON(steps.validate.outputs.scenario_timeout) }}
         env:
+          LAB_ROOT: ${{ github.workspace }}
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           LAB_SCENARIO: ${{ steps.validate.outputs.scenario }}
           LAB_REPEAT: ${{ steps.validate.outputs.repeat }}
           LAB_TIMEOUT_MIN: ${{ steps.validate.outputs.timeout_min }}
+          LAB_NEEDS_JUJU: ${{ steps.validate.outputs.needs_juju }}
+          LAB_CLOUD: localhost
+          LAB_JUJU_SOURCE: snap
+          LAB_JUJU_VERSION: ${{ steps.juju.outputs.juju_version }}
+          LAB_JUJU_GIT_COMMIT: ${{ steps.juju.outputs.juju_git_commit }}
+          LAB_REF: ""
+          LAB_REF_SHA: ""
+          LAB_TESTS_DIR: ${{ steps.validate.outputs.needs_tests == '1' && format('{0}/juju-tests/tests', github.workspace) || '' }}
+          LAB_TESTS_SHA: ${{ steps.tests.outputs.tests_sha }}
+          BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
         run: scripts/run-scenario.sh
+
+      - name: Collect logs
+        id: collect
+        if: always()
+        timeout-minutes: 10
+        env:
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+          LAB_NEEDS_JUJU: ${{ steps.validate.outputs.needs_juju }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          READY_OUTCOME: ${{ steps.ready.outcome }}
+          SCENARIO_OUTCOME: ${{ steps.scenario.outcome }}
+        run: scripts/collect.sh
+
+      - name: Scrub
+        id: scrub
+        if: always()
+        timeout-minutes: 3
+        env:
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_UPLOAD_DIR: ${{ runner.temp }}/lab-upload
+          LAB_STATE_DIR: ${{ runner.temp }}/lab-state
+        run: scripts/scrub.sh
 
       - name: Verdict and job summary
         id: verdict
@@ -99,30 +232,73 @@ jobs:
         timeout-minutes: 2
         env:
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_UPLOAD_DIR: ${{ runner.temp }}/lab-upload
           LAB_STATE_DIR: ${{ runner.temp }}/lab-state
           VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
           READY_OUTCOME: ${{ steps.ready.outcome }}
           SCENARIO_OUTCOME: ${{ steps.scenario.outcome }}
         run: scripts/verdict.sh
 
-      # Uploads even if verdict.sh died (the job stays red: no verdict).
-      # PR-3: gate the full upload on scrub success; every other outcome
-      # uploads only verdict.json + collect.log.
+      # Full upload (the scrubbed snapshot, never the live dir) only when scrub
+      # succeeded, found no private key and verdict.sh agrees; every other
+      # outcome (blocked, failed, timed out, skipped), and a failed full upload,
+      # uploads only verdict.json + collect.log, so scrub fails closed. Exactly
+      # one artifact per run either way. The fallback name keeps logs if
+      # verdict.sh died.
       - name: Upload artifact
-        if: always()
+        id: upload
+        if: always() && steps.scrub.outcome == 'success' && steps.scrub.outputs.upload_blocked == 'false' && steps.verdict.outputs.upload_blocked == 'false'
         timeout-minutes: 3
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.verdict.outputs.artifact_name || format('lab-logs-invalid-{0}', github.run_id) }}
-          path: ${{ runner.temp }}/lab-artifacts
+          path: ${{ runner.temp }}/lab-upload
           retention-days: 7
           if-no-files-found: error
 
-      - name: Job result (green only for pass)
+      - name: Stage minimal artifact
+        id: minimal
+        if: always() && (!(steps.scrub.outcome == 'success' && steps.scrub.outputs.upload_blocked == 'false' && steps.verdict.outputs.upload_blocked == 'false') || steps.upload.outcome == 'failure')
+        timeout-minutes: 1
+        env:
+          LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
+          LAB_UPLOAD_DIR: ${{ runner.temp }}/lab-upload
+          LAB_MINIMAL_DIR: ${{ runner.temp }}/lab-minimal
+        run: scripts/minimal-artifact.sh
+
+      - name: Upload minimal artifact
+        if: always() && steps.minimal.outcome == 'success'
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.verdict.outputs.artifact_name || format('lab-logs-invalid-{0}', github.run_id) }}
+          path: ${{ runner.temp }}/lab-minimal
+          retention-days: 7
+          if-no-files-found: error
+          # Replaces a partial artifact left by a failed full upload.
+          overwrite: true
+
+      # Best effort, never affects the verdict (design §7); the VM is discarded anyway.
+      - name: Teardown
+        if: always() && steps.validate.outputs.needs_juju == '1'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          if command -v juju >/dev/null; then
+            timeout 4m juju kill-controller -t 0 --no-prompt "$LAB_CONTROLLER" || true
+          fi
+
+      # Green only for pass with a clean scrub and a full upload (a redaction, a
+      # blocked or failed upload turns the job red so a human looks;
+      # verdict.json keeps the real verdict).
+      - name: Job result
         if: always()
         timeout-minutes: 1
         env:
           VERDICT: ${{ steps.verdict.outputs.verdict }}
+          SCRUB_HITS: ${{ steps.verdict.outputs.scrub_hits }}
+          UPLOAD_BLOCKED: ${{ steps.verdict.outputs.upload_blocked }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
         run: |
-          echo "verdict: ${VERDICT:-missing}"
-          [ "${VERDICT:-}" = pass ]
+          echo "verdict: ${VERDICT:-missing}, scrub_hits: ${SCRUB_HITS:-missing}, upload_blocked: ${UPLOAD_BLOCKED:-missing}, upload: ${UPLOAD_OUTCOME:-missing}"
+          [ "${VERDICT:-}" = pass ] && [ "${SCRUB_HITS:-}" = 0 ] && [ "${UPLOAD_BLOCKED:-}" = false ] && [ "${UPLOAD_OUTCOME:-}" = success ]
