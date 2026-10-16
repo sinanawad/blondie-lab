@@ -1,0 +1,18 @@
+# FIXTURE: must fail zizmor ONLINE (impostor-commit). Offline zizmor reports nothing
+# here, so this proves the online audits ran. Never move into .github/workflows.
+# 7358b1b is the head of a fork PR to actions/checkout (actions/checkout#2442, from
+# kranthipoturaju/checkout): reachable through the fork network but not from any
+# actions/checkout branch or tag. If that PR is ever merged with its commits, this
+# check fails loudly; replace the SHA with another fork-only commit.
+name: fixture-impostor-commit
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  bad:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/checkout@7358b1bbf59494f0fbf9b0c19146700378ab8f6b # v7.0.1
+        with:
+          persist-credentials: false

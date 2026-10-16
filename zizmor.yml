@@ -1,5 +1,6 @@
-# zizmor config. Design §8: every action is pinned to a full commit SHA, including
-# GitHub-owned ones (zizmor's default allows ref-pins for actions/* and github/*).
+# zizmor config. Design §8: every action is pinned to a full commit SHA, GitHub-owned
+# ones included. Identical to the zizmor 1.30.1 default; kept so a future default
+# change can't loosen it.
 rules:
   unpinned-uses:
     config:

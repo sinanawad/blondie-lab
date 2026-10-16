@@ -17,17 +17,17 @@ Disposable, public Juju test lab run on GitHub Actions. Owner: @sinanawad. Opera
 ## Rules (hard)
 1. **Public repo. No secrets, ever.** No CharmHub tokens, cloud credentials, SSH keys, or `secrets.*` usage. Work needing credentials goes elsewhere (private).
 2. **No non-public material.** No embargoed security fixes, no internal Canonical infra details (IPs, hosts, juju-ci internals), no customer data.
-3. **Triggers:** `workflow_dispatch` and `push` to `main`; `pull_request` only for `lint.yml` and only for same-repo heads (job `if:` on `head.repo.full_name`). Never `pull_request_target`. Fork code never runs; fork PR workflows also need approval (repo setting).
+3. **Triggers:** `workflow_dispatch` and `push` to `main`; `pull_request` only for `lint.yml`. On a fork PR, `lint` fails in its first step, before checkout (fail closed: a skipped job would count as a passing required check). Never `pull_request_target`. Fork code never runs; fork PR workflows also need approval (repo setting).
 4. **Least privilege:** `permissions: {}` at the top of every workflow; each job grants only what it needs (normally `contents: read`). `persist-credentials: false` on every checkout. Every action is pinned to a full commit SHA with a version comment, GitHub-owned ones included (enforced by repo policy and zizmor). Inputs reach `run:` only through `env:`, never as `${{ inputs.* }}` inline.
 5. **Disposable and time-boxed:** every heavy step has its own `timeout-minutes`; the job timeout is only a backstop. Teardown is best effort; the runner VM is discarded anyway.
-6. Changes go through pull requests reviewed by Sinan (ruleset on `main`: PR plus 1 approval, no force-push). Dispatching an existing workflow does not need review.
+6. Changes go through pull requests reviewed by Sinan (ruleset on `main`: PR plus 1 approval, no force-push). **Dispatching from `main` needs no review.** Dispatching from a branch runs that branch's workflow file, which is unreviewed and can request write permissions in its own `permissions:` block (the repo's read-only default applies only to workflows without one). Use branch dispatches only to test that branch's PR, and take evidence only from `ref=main` runs (check `lab_sha` in `verdict.json`).
 
 ## Layout
 | Path | What |
 |---|---|
 | `.github/workflows/lab-lxd.yml` | Dispatch: run a scenario against Juju on LXD. **Currently a stub** that validates and echoes inputs |
 | `.github/workflows/lab-microk8s.yml` | Same on MicroK8s. **Currently a stub** |
-| `.github/workflows/lint.yml` | actionlint, zizmor (online audits), shellcheck, and the lint-fixtures check. Single job `lint` |
+| `.github/workflows/lint.yml` | actionlint, zizmor (online audits, `--min-severity low`), shellcheck (by shebang), and the lint-fixtures check. Single job `lint` |
 | `zizmor.yml`, `lint-requirements.txt` | zizmor config (hash-pin policy for all actions) and its hash-pinned install |
 | `lint-fixtures/` | Known-bad files that each linter must keep failing on. Never move them into `.github/workflows/` |
 | `scripts/` | Shared helpers (`check-lint-fixtures.sh` now; harness scripts later) |

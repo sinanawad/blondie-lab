@@ -43,7 +43,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: lab-${{ inputs.request_id || github.run_id }}
+  # Per workflow. With cancel-in-progress: false a duplicate dispatch with the same
+  # request_id waits for the first one (serialised, not de-duplicated).
+  group: ${{ github.workflow }}-${{ inputs.request_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -64,6 +66,7 @@ jobs:
           IN_REQUEST_ID: ${{ inputs.request_id }}
         run: |
           set -euo pipefail
+          export LC_ALL=C
           err() { echo "::error::$*"; exit 2; }
           re_scenario='^[a-z0-9][a-z0-9-]{0,63}$'
           re_ref='^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$'
@@ -75,8 +78,11 @@ jobs:
             local name=$1 v=$2
             [[ -z $v ]] && return 0
             [[ $v =~ $re_ref ]] || err "$name: must match $re_ref"
+            # git check-ref-format rules not covered by the regex ('@' is outside its
+            # character set, so '@{' can't occur): no refs/ prefix, no '..' or '//',
+            # no path component starting with '.' or ending in '.lock', no trailing '/' or '.'.
             case $v in
-              refs/* | *..* | *//* | *@\{* | */ | *.lock) err "$name: refs/ prefix, '..', '//', '@{', trailing '/' or '.lock' not allowed" ;;
+              refs/* | *..* | *//* | */.* | *.lock | *.lock/* | */ | *.) err "$name: refs/ prefix, '..', '//', a component starting with '.' or ending in '.lock', or a trailing '/' or '.' is not allowed" ;;
             esac
           }
           check_ref ref "$IN_REF"

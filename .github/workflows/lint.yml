@@ -1,5 +1,7 @@
 # Lint for blondie-lab. Single job named `lint` (the ruleset's required check).
-# No live Juju here. Fork PRs never run (same-repo `if:` below).
+# No live Juju here. Fork PRs fail closed in the first step, before checkout, so fork
+# code never runs and a fork PR can't show a green `lint` (a job skipped by a
+# job-level `if:` reports Success, which satisfies a required check).
 name: lint
 
 on:
@@ -11,12 +13,12 @@ permissions: {}
 
 concurrency:
   group: lint-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on PR branches only; every push to main keeps its own lint result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
     name: lint
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -26,6 +28,12 @@ jobs:
       # sha256 of actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksums.txt
       ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
     steps:
+      - name: Refuse fork PRs (fail closed, before checkout)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::fork PRs are not linted here; push the branch to this repository instead"
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,12 +59,16 @@ jobs:
       - name: zizmor (workflows, online audits)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: '"$RUNNER_TEMP/lint-venv/bin/zizmor" --config zizmor.yml --min-severity medium .github/workflows'
+        run: '"$RUNNER_TEMP/lint-venv/bin/zizmor" --config zizmor.yml --min-severity low .github/workflows'
 
       - name: shellcheck (scripts and scenarios)
         run: |
-          mapfile -t files < <(find scripts scenarios -type f -name '*.sh' 2>/dev/null | sort)
-          if [ "${#files[@]}" -eq 0 ]; then echo "no shell scripts"; exit 0; fi
+          set -euo pipefail
+          test -d scripts || { echo "::error::scripts/ is missing"; exit 1; }
+          # Tracked files under scripts/ and scenarios/ with a sh/bash/dash shebang,
+          # whatever their extension (e.g. scripts/lab-kubectl).
+          mapfile -t files < <(git ls-files -z scripts scenarios | xargs -0 -r grep -lE '^#!.*\b(ba|da)?sh\b' | sort)
+          if [ "${#files[@]}" -eq 0 ]; then echo "::error::no shell scripts found under scripts/"; exit 1; fi
           printf '%s\n' "${files[@]}"
           shellcheck -x "${files[@]}"
 
