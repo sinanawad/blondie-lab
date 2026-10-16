@@ -510,18 +510,38 @@ mkdir -p "$fj"
 cat >"$fj/juju" <<'FAKE'
 #!/usr/bin/env bash
 case $1 in
-models) if [[ -s $FAKE_MODELS ]]; then printf '{"models":[{"short-name":"controller","is-controller":true},{"short-name":"%s","is-controller":false}]}\n' "$(cat "$FAKE_MODELS")"; else echo '{"models":[{"short-name":"controller","is-controller":true}]}'; fi ;;
-destroy-model) echo "destroy $*" >>"$FAKE_LOG"; [[ ${FAKE_STUCK:-0} == 1 ]] || : >"$FAKE_MODELS" ;;
+# $FAKE_MODELS: one qualified model name per line. Other users' models
+# (qualifier != admin) are listed only with --all, like juju's admin view.
+models)
+	all=0
+	for a in "$@"; do [[ $a == --all ]] && all=1; done
+	{
+		echo '{"name":"admin/controller","short-name":"controller","is-controller":true}'
+		if [[ -s $FAKE_MODELS ]]; then
+			while read -r m; do
+				[[ $all == 1 || $m == admin/* ]] || continue
+				jq -nc --arg n "$m" '{name: $n, "short-name": ($n | sub(".*/"; "")), "is-controller": false}'
+			done <"$FAKE_MODELS"
+		fi
+	} | jq -sc '{models: .}' ;;
+destroy-model)
+	echo "destroy $*" >>"$FAKE_LOG"
+	if [[ ${FAKE_STUCK:-0} != 1 ]]; then
+		m=${*: -1}
+		m=${m#*:}
+		grep -vxF -- "$m" "$FAKE_MODELS" >"$FAKE_MODELS.n" || true
+		mv "$FAKE_MODELS.n" "$FAKE_MODELS"
+	fi ;;
 esac
 FAKE
 chmod +x "$fj/juju"
 # shellcheck disable=SC2016 # expanded by the scenario
-mk leaves-model 'echo m1 >"$FAKE_MODELS"; exit 0' SUBSTRATE=any TIMEOUT_MIN=1 NEEDS_JUJU=0
+mk leaves-model 'echo admin/m1 >"$FAKE_MODELS"; exit 0' SUBSTRATE=any TIMEOUT_MIN=1 NEEDS_JUJU=0
 : >"$tmp/fake.log"
 pipeline "$tmp/art-clean-ok" "$tmp/scen" leaves-model 2 PATH="$fj:$PATH" LAB_NEEDS_JUJU=1 LAB_CONTROLLER=lab \
 	FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log"
 if jq -e '.verdict == "pass" and (.results | length) == 2' "$tmp/art-clean-ok/verdict.json" >/dev/null &&
-	[[ $(grep -c 'destroy-model --no-prompt --force --no-wait --destroy-storage lab:m1' "$tmp/fake.log") == 1 ]] &&
+	[[ $(grep -c 'destroy-model --no-prompt --force --no-wait --destroy-storage lab:admin/m1' "$tmp/fake.log") == 1 ]] &&
 	[[ -f $tmp/art-clean-ok/cleanup-1.log && ! -e $tmp/art-clean-ok/cleanup-2.log ]]; then
 	pass "cleanup: model destroyed between iterations only (not after the last)"
 else
@@ -581,7 +601,7 @@ cleanup_run() { # cleanup_run <name> [VAR=value...]
 	env -i PATH="$fk:$fj:$PATH" HOME="$tmp" LAB_CONTROLLER=lab FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log" \
 		FAKE_NS_DIR="$nsd" "$@" bash scripts/cleanup-models.sh >"$tmp/$n.out" 2>&1 || crc=$?
 }
-echo m1 >"$tmp/fake.models"
+echo admin/m1 >"$tmp/fake.models"
 fakens m1 3 m1 suite-ns 2 suite-ns controller-lab stuck controller
 cleanup_run nsok LAB_SUBSTRATE=k8s
 if ((crc == 0)) && grep -qx 'cleanup: namespace m1 gone (NotFound)' "$tmp/nsok.out" &&
@@ -592,7 +612,7 @@ else
 	bad "cleanup k8s namespace wait (rc $crc)"
 	cat "$tmp/nsok.out"
 fi
-echo m1 >"$tmp/fake.models"
+echo admin/m1 >"$tmp/fake.models"
 fakens m1 stuck m1
 cleanup_run nsstuck LAB_SUBSTRATE=k8s LAB_CLEANUP_TIMEOUT=3
 if ((crc == 1)) && grep -q 'cleanup: still present after 3s: m1' "$tmp/nsstuck.out"; then
@@ -601,10 +621,23 @@ else
 	bad "cleanup k8s stuck namespace (rc $crc)"
 	cat "$tmp/nsstuck.out"
 fi
-echo m1 >"$tmp/fake.models"
+echo admin/m1 >"$tmp/fake.models"
 fakens m1 stuck m1
 cleanup_run nslxd LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
 if ((crc == 0)) && ! grep -q kubectl "$tmp/fake.log"; then pass "cleanup lxd: no namespace wait"; else bad "cleanup lxd (rc $crc)"; cat "$tmp/nslxd.out"; fi
+# All users' models, by qualified name: another user's model with the same
+# short name is destroyed too, and separately.
+printf '%s\n' admin/m1 bob/m1 bob/controller >"$tmp/fake.models"
+cleanup_run allusers LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
+if ((crc == 0)) && grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:admin/m1' "$tmp/fake.log" &&
+	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/m1' "$tmp/fake.log" &&
+	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/controller' "$tmp/fake.log" &&
+	! grep -q 'lab:admin/controller' "$tmp/fake.log" && [[ ! -s $tmp/fake.models ]]; then
+	pass "cleanup: models --all, every user's model destroyed by qualified name (bob/controller too, never admin/controller)"
+else
+	bad "cleanup all users (rc $crc)"
+	cat "$tmp/allusers.out" "$tmp/fake.log"
+fi
 
 # bootstrap.sh watchdog: a hung bootstrap is dumped (k8s) before juju is killed.
 fb="$tmp/fake-boot"
@@ -763,6 +796,26 @@ if ((nrc == 0)) && grep -qx 'drill: teardown ok, no models or model namespaces l
 fakens leftover stuck leftover
 nml nmllxd LAB_SUBSTRATE=lxd
 if ((nrc == 0)); then pass "no-models-left lxd: namespaces not checked"; else bad "no-models-left lxd (rc $nrc)"; cat "$tmp/nmllxd.out"; fi
+echo bob/left >"$tmp/fake.models"
+fakens controller-lab stuck controller
+nml nmlother LAB_SUBSTRATE=lxd
+if ((nrc == 1)) && grep -qx 'drill: suite passed but its teardown left models after 3s: bob/left' "$tmp/nmlother.out"; then
+	pass "no-models-left: another user's leftover model (only visible with --all) -> fail"
+else
+	bad "no-models-left other user (rc $nrc)"
+	cat "$tmp/nmlother.out"
+fi
+# Only the controller model itself is excluded: another user's model named
+# "controller" is a leftover like any other.
+echo bob/controller >"$tmp/fake.models"
+nml nmlbobctl LAB_SUBSTRATE=lxd
+if ((nrc == 1)) && grep -qx 'drill: suite passed but its teardown left models after 3s: bob/controller' "$tmp/nmlbobctl.out"; then
+	pass "no-models-left: bob/controller is not the controller model -> fail"
+else
+	bad "no-models-left bob/controller (rc $nrc)"
+	cat "$tmp/nmlbobctl.out"
+fi
+: >"$tmp/fake.models"
 
 b="$tmp/boot-bad"
 mkdir -p "$b.state"

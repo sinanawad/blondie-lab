@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Between iterations (design §4 repeat semantics): destroy every non-controller
-# model on the lab controller and wait until none is left and, on k8s
+# model on the lab controller (all users' models, by qualified name) and wait until none is left and, on k8s
 # (LAB_SUBSTRATE=k8s), until every juju model namespace is gone too: the
 # namespaces of the models destroyed here and any other namespace labelled
 # model.juju.is/name other than the controller's (a suite that destroyed its own
@@ -17,9 +17,15 @@ deadline=$((SECONDS + budget))
 here=$(cd "$(dirname "$0")" && pwd)
 kubectl="$here/lab-kubectl"
 
+# Every user's models (--all; the lab user is the controller admin), by
+# qualified name (<qualifier>/<model>), so a suite that creates models as or
+# for another user can't leave them behind unseen, and two users' models with
+# the same short name are destroyed separately. Only the controller model is
+# excluded (is-controller, or exactly admin/controller): another user's model
+# named "controller" (bob/controller) is destroyed like any other.
 models() {
-	timeout 60 juju models -c "$controller" --format=json |
-		jq -r '.models // [] | .[] | select(((."is-controller") | tostring) != "true" and ."short-name" != "controller") | ."short-name"'
+	timeout 60 juju models --all -c "$controller" --format=json |
+		jq -r '.models // [] | .[] | select(((."is-controller") | tostring) != "true") | (if (.name // "") | contains("/") then .name else ."short-name" end) | select(. != "admin/controller" and . != "controller")'
 }
 # Namespaces of juju models (label model.juju.is/name, not "controller").
 model_namespaces() {
@@ -44,7 +50,10 @@ done
 # namespace (seen now or appearing during the wait).
 ns=$(model_namespaces) || { echo "cleanup: listing namespaces failed"; exit 1; }
 declare -A want=()
-for n in $destroyed $ns; do [[ $n =~ ^[a-z0-9-]{1,63}$ ]] && want[$n]=1; done
+for n in $destroyed $ns; do
+	n=${n##*/} # a model's namespace is its short name
+	[[ $n =~ ^[a-z0-9-]{1,63}$ ]] && want[$n]=1
+done
 names="${!want[*]}"
 echo "cleanup: waiting for model namespace(s) to be gone: ${names:-none}"
 while :; do
