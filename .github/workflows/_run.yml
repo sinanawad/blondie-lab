@@ -175,6 +175,8 @@ jobs:
           LAB_ARTIFACT_DIR: ${{ runner.temp }}/lab-artifacts
           # Copied from juju/juju smoke.yml (design §3).
           BOOTSTRAP_ADDITIONAL_ARGS: --model-default enable-os-upgrade=false
+          # TEMPORARY DRILL (PR-4 bootstrap-hang): removed before review.
+          LAB_BOOTSTRAP_TIMEOUT: "30"
         run: |
           if [ "$LAB_SUBSTRATE" = k8s ]; then
             exec sg snap_microk8s -c "$GITHUB_WORKSPACE/scripts/bootstrap.sh"
