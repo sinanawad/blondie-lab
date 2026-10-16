@@ -1,0 +1,9 @@
+# Anchored ERE patterns on juju/juju tests/ harness wording only (design §4).
+# Matched only against main.sh output before the first "===> [   ] Running:"
+# line. A match turns main.sh's exit 1 into setup-error and is recorded as
+# infra_signature. Never add bare words like "already exists".
+#
+# tests/includes/check.sh check_dependencies():
+^Missing dependencies: 
+# tests/includes/juju.sh bootstrap() on a reused controller with a leftover model:
+^[^ ]+ already exists\. Use the following to clean up the environment:$

@@ -24,6 +24,7 @@ mk t6 'exit 0' SUBSTRATE=any TIMEOUT_MIN=6 NEEDS_JUJU=0
 mk t7 'exit 0' SUBSTRATE=any TIMEOUT_MIN=7 NEEDS_JUJU=0
 mk juju 'exit 0' SUBSTRATE=any TIMEOUT_MIN=2
 mk juju-notests 'exit 0' SUBSTRATE=any TIMEOUT_MIN=2 NEEDS_TESTS=0
+mk juju-tests 'exit 0' SUBSTRATE=lxd TIMEOUT_MIN=2 NEEDS_TESTS=1 DEPS=charmcraft
 # shellcheck disable=SC2016 # literal on purpose: must be rejected, never run
 mk badkey 'exit 0' SUBSTRATE=any TIMEOUT_MIN=2 NEEDS_JUJU=0 EVIL='$(id)'
 mk dupkey 'exit 0' SUBSTRATE=any TIMEOUT_MIN=2 NEEDS_JUJU=0 TIMEOUT_MIN=1
@@ -70,8 +71,11 @@ expect 2 "scenario that doesn't exist" nope 1 "does not exist"
 expect 2 "SUBSTRATE mismatch (lxd scenario on k8s)" lxd-only 1 "needs SUBSTRATE=lxd, this workflow is k8s"
 expect 2 "NEEDS_JUJU=0 with SUBSTRATE=lxd" lxd-only 1 "NEEDS_JUJU=0 requires SUBSTRATE=any" LAB_SUBSTRATE=lxd
 expect 2 "NEEDS_JUJU=0 with DEPS" nojuju-deps 1 "NEEDS_JUJU=0 excludes"
-expect 2 "needs Juju (not implemented yet)" juju 1 "needs Juju; the k8s substrate is not implemented"
-expect 2 "ref on a Juju scenario (build mode not implemented yet)" juju 1 "build mode is not implemented" LAB_IN_REF=v4.0.14
+expect 2 "Juju scenario on k8s (PR-4)" juju 1 "the k8s substrate is not implemented yet (plan PR-4)"
+expect 0 "Juju scenario on lxd" juju 1 "needs_juju=1 needs_tests=0 deps= juju_channel=4.0/stable" LAB_SUBSTRATE=lxd
+expect 0 "Juju scenario with tests + DEPS on lxd" juju-tests 2 "needs_juju=1 needs_tests=1 deps=charmcraft scenario_timeout=16" LAB_SUBSTRATE=lxd
+expect 2 "ref on a Juju scenario (build mode not implemented yet)" juju 1 "build mode is not implemented" LAB_IN_REF=v4.0.14 LAB_SUBSTRATE=lxd
+expect 2 "explicit tests_ref (trust check is PR-5)" juju-tests 1 "explicit tests_ref needs the ref trust check" LAB_IN_TESTS_REF=v4.0.14 LAB_SUBSTRATE=lxd
 expect 2 "tests_ref with NEEDS_TESTS=0" juju-notests 1 "tests_ref: not used by scenario juju-notests (NEEDS_TESTS=0)" LAB_IN_TESTS_REF=v4.0.14
 expect 2 "unknown scenario.env key" badkey 1 "unknown key EVIL"
 expect 2 "duplicate scenario.env key" dupkey 1 "duplicate key TIMEOUT_MIN"
@@ -226,5 +230,184 @@ else
 	bad "summary excerpt"
 	cat "$art.summary"
 fi
+
+# --- scrub.sh / minimal-artifact.sh ----------------------------------------------
+art="$tmp/scrub-art"
+st="$tmp/scrub-state"
+rm -rf "$art" "$st"
+mkdir -p "$art/sub" "$st"
+printf '%s\n' '{"password": "x"}' 'password reset requested' 'the password field is empty' >"$art/a.txt"
+printf '%s\n' 'admin-secret: hunter2' 'ApiPassword=abc def' "  statepassword: 'q'" 'macaroons: [[{"c":1}]]' 'passwords are hard' >"$art/sub/b.yaml"
+: >"$tmp/scrub.out"
+env -i PATH="$PATH" LAB_ARTIFACT_DIR="$art" LAB_STATE_DIR="$st" GITHUB_OUTPUT="$tmp/scrub.out" bash scripts/scrub.sh >"$tmp/log" 2>&1
+if grep -qx 'scrub_hits=5' "$st/scrub.env" && grep -qx 'upload_blocked=false' "$st/scrub.env" &&
+	grep -qx '{"password": <redacted>' "$art/a.txt" && grep -qx 'password reset requested' "$art/a.txt" &&
+	grep -qx 'the password field is empty' "$art/a.txt" && grep -qx 'admin-secret: <redacted>' "$art/sub/b.yaml" &&
+	grep -qx 'ApiPassword=<redacted> def' "$art/sub/b.yaml" && grep -qx '  statepassword: <redacted>' "$art/sub/b.yaml" &&
+	grep -qx 'macaroons: <redacted>' "$art/sub/b.yaml" && grep -qx 'passwords are hard' "$art/sub/b.yaml" && grep -qx 'scrub_hits=5' "$tmp/scrub.out"; then
+	pass "scrub: 5 key/value hits redacted in place, bare words untouched"
+else
+	bad "scrub key/value"
+	cat "$st/scrub.env" "$art/a.txt" "$art/sub/b.yaml" "$tmp/log"
+fi
+art="$tmp/scrub-clean"
+rm -rf "$art" "$st"
+mkdir -p "$art" "$st"
+printf '%s\n' 'password reset requested' 'juju add-model --password-stdin' >"$art/c.txt"
+env -i PATH="$PATH" LAB_ARTIFACT_DIR="$art" LAB_STATE_DIR="$st" bash scripts/scrub.sh >"$tmp/log" 2>&1
+if grep -qx 'scrub_hits=0' "$st/scrub.env"; then pass "scrub: no key/value form -> 0 hits"; else bad "scrub clean"; cat "$st/scrub.env"; fi
+art="$tmp/scrub-pk"
+rm -rf "$art" "$st" "$tmp/min"
+mkdir -p "$art/keys" "$st"
+{ printf -- '-----BEGIN %s PRIVATE KEY-----\n' OPENSSH; echo zz; } >"$art/keys/k.txt"
+echo '{"verdict":"pass"}' >"$art/verdict.json"
+echo "collect ok" >"$art/collect.log"
+env -i PATH="$PATH" LAB_ARTIFACT_DIR="$art" LAB_STATE_DIR="$st" bash scripts/scrub.sh >"$tmp/log" 2>&1
+env -i PATH="$PATH" LAB_ARTIFACT_DIR="$art" LAB_MINIMAL_DIR="$tmp/min" bash scripts/minimal-artifact.sh >>"$tmp/log" 2>&1
+if grep -qx 'upload_blocked=true' "$st/scrub.env" && grep -qx 'upload_blocked_path=keys/k.txt' "$st/scrub.env" &&
+	[[ $(find "$tmp/min" -type f -printf '%f\n' | sort | tr '\n' ' ') == "collect.log verdict.json " ]] && ! grep -rq 'PRIVATE KEY' "$tmp/min"; then
+	pass "scrub: private key -> upload_blocked, path only; minimal = verdict.json + collect.log"
+else
+	bad "scrub private key"
+	cat "$st/scrub.env" "$tmp/log"
+fi
+{ printf -- '-----BEGIN %s PRIVATE KEY-----\n' RSA; } >"$art/collect.log"
+env -i PATH="$PATH" LAB_ARTIFACT_DIR="$art" LAB_MINIMAL_DIR="$tmp/min" bash scripts/minimal-artifact.sh >"$tmp/log" 2>&1
+if grep -qx 'collect.log withheld: it contains private key material' "$tmp/min/collect.log"; then pass "minimal: collect.log with key material withheld"; else bad "minimal withhold"; fi
+
+# --- suite.sh: infra signatures only in the setup phase -------------------------
+stub="$tmp/stub-bin"
+mkdir -p "$stub"
+for t in curl yq shellcheck; do
+	command -v "$t" >/dev/null || printf '#!/bin/sh\nexit 0\n' >"$stub/$t"
+done
+chmod +x "$stub"/* 2>/dev/null || true
+# fake_tests <name> <exit code> <output lines...>: a tests/ dir whose main.sh prints the lines.
+fake_tests() {
+	local d="$tmp/tests-$1" rc=$2
+	shift 2
+	mkdir -p "$d"
+	{
+		echo '#!/usr/bin/env bash'
+		echo 'mkdir -p tmp.abc && echo "suite log" >tmp.abc/test.log'
+		printf 'printf "%%s\\n"'
+		printf " '%s'" "$@"
+		echo
+		echo "exit $rc"
+	} >"$d/main.sh"
+	chmod +x "$d/main.sh"
+}
+SIG_DUP='test-smoke already exists. Use the following to clean up the environment:'
+fake_tests depmiss 1 '==> Checking for dependencies' 'Missing dependencies: yq'
+fake_tests leftover 1 '==> TEST BEGIN: smoke' "$SIG_DUP" '    juju switch lab'
+# After the marker: the sentence unprefixed (as main.sh -v streams a test log) and prefixed (RUN OUTPUT).
+fake_tests intest 1 '==> TEST BEGIN: labdrill' '===> [   ] Running: labdrill dup' "$SIG_DUP" 'Missing dependencies: jq' '==> RUN OUTPUT: test_labdrill' "    | $SIG_DUP" 'ERROR model "x" already exists'
+fake_tests plainfail 1 '==> TEST BEGIN: smoke' 'something failed'
+fake_tests ok 0 '===> [   ] Running: charmhub deploy'
+# suite_case <name> <want rc> <want signal ("" = none)>
+suite_case() {
+	local name=$1 want=$2 wsig=$3 rc=0 art="$tmp/suite-art-$1" sig="$tmp/suite-sig-$1"
+	rm -rf "$art" "$sig"
+	mkdir -p "$art"
+	env -i PATH="$stub:$PATH" LAB_TESTS_DIR="$tmp/tests-$name" LAB_CONTROLLER=lab LAB_ARTIFACT_DIR="$art" \
+		LAB_ITERATION=1 LAB_SIGNAL_FILE="$sig" bash scripts/suite.sh smoke >"$tmp/log" 2>&1 || rc=$?
+	local got_sig=""
+	[[ -f $sig ]] && got_sig=$(cat "$sig")
+	if [[ $rc == "$want" && $got_sig == "$wsig" && -f $art/suite-i1/tmp.abc/test.log && ! -e $tmp/tests-$name/tmp.abc ]]; then
+		pass "suite.sh: $name -> exit $rc, signature [${wsig}], work dir copied"
+	else
+		bad "suite.sh: $name -> exit $rc sig '$got_sig', want $want '$wsig'"
+		cat "$tmp/log"
+	fi
+}
+suite_case depmiss 2 'Missing dependencies: yq'
+suite_case leftover 2 "$SIG_DUP"
+suite_case intest 1 ''
+suite_case plainfail 1 ''
+suite_case ok 0 ''
+
+# Signature end to end: run-scenario records it (exit 2 only), verdict shows it.
+mk sig-pos "exec \"$PWD/scripts/suite.sh\" smoke" SUBSTRATE=any TIMEOUT_MIN=1 NEEDS_JUJU=0
+mk sig-neg "exec \"$PWD/scripts/suite.sh\" smoke" SUBSTRATE=any TIMEOUT_MIN=1 NEEDS_JUJU=0
+pipeline "$tmp/art-sig-pos" "$tmp/scen" sig-pos 1 PATH="$stub:$PATH" LAB_TESTS_DIR="$tmp/tests-leftover" LAB_CONTROLLER=lab
+check "verdict: setup-phase signature -> setup-error, infra_signature = full sentence" "$tmp/art-sig-pos" \
+	".verdict == \"setup-error\" and .infra_signature == \"$SIG_DUP\" and (.reason | test(\"infra signature\"))"
+pipeline "$tmp/art-sig-neg" "$tmp/scen" sig-neg 1 PATH="$stub:$PATH" LAB_TESTS_DIR="$tmp/tests-intest" LAB_CONTROLLER=lab
+check "verdict: same sentence after a test started -> fail, infra_signature null" "$tmp/art-sig-neg" \
+	'.verdict == "fail" and .infra_signature == null'
+# A signal file without exit 2 is ignored.
+# shellcheck disable=SC2016 # expanded by the scenario
+mk sig-forged 'echo "forged" >"$LAB_SIGNAL_FILE"; exit 1' SUBSTRATE=any TIMEOUT_MIN=1 NEEDS_JUJU=0
+pipeline "$tmp/art-sig-forged" "$tmp/scen" sig-forged 1
+check "verdict: signal without exit 2 ignored -> fail" "$tmp/art-sig-forged" '.verdict == "fail" and .infra_signature == null'
+
+# --- cleanup between iterations (LAB_NEEDS_JUJU=1) --------------------------------
+fj="$tmp/fake-juju"
+mkdir -p "$fj"
+cat >"$fj/juju" <<'FAKE'
+#!/usr/bin/env bash
+case $1 in
+models) if [[ -s $FAKE_MODELS ]]; then printf '{"models":[{"short-name":"controller","is-controller":true},{"short-name":"%s","is-controller":false}]}\n' "$(cat "$FAKE_MODELS")"; else echo '{"models":[{"short-name":"controller","is-controller":true}]}'; fi ;;
+destroy-model) echo "destroy $*" >>"$FAKE_LOG"; [[ ${FAKE_STUCK:-0} == 1 ]] || : >"$FAKE_MODELS" ;;
+esac
+FAKE
+chmod +x "$fj/juju"
+# shellcheck disable=SC2016 # expanded by the scenario
+mk leaves-model 'echo m1 >"$FAKE_MODELS"; exit 0' SUBSTRATE=any TIMEOUT_MIN=1 NEEDS_JUJU=0
+: >"$tmp/fake.log"
+pipeline "$tmp/art-clean-ok" "$tmp/scen" leaves-model 2 PATH="$fj:$PATH" LAB_NEEDS_JUJU=1 LAB_CONTROLLER=lab \
+	FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log"
+if jq -e '.verdict == "pass" and (.results | length) == 2' "$tmp/art-clean-ok/verdict.json" >/dev/null &&
+	[[ $(grep -c 'destroy-model --no-prompt --force --no-wait --destroy-storage lab:m1' "$tmp/fake.log") == 1 ]] &&
+	[[ -f $tmp/art-clean-ok/cleanup-1.log && ! -e $tmp/art-clean-ok/cleanup-2.log ]]; then
+	pass "cleanup: model destroyed between iterations only (not after the last)"
+else
+	bad "cleanup between iterations"
+	cat "$tmp/fake.log" "$tmp/art-clean-ok/verdict.json"
+fi
+pipeline "$tmp/art-clean-stuck" "$tmp/scen" leaves-model 3 PATH="$fj:$PATH" LAB_NEEDS_JUJU=1 LAB_CONTROLLER=lab \
+	FAKE_MODELS="$tmp/fake.models" FAKE_LOG="$tmp/fake.log" FAKE_STUCK=1 LAB_CLEANUP_TIMEOUT=2
+check "cleanup: unfinished cleanup stops the loop -> setup-error" "$tmp/art-clean-stuck" \
+	'.verdict == "setup-error" and (.results | length) == 1 and .results[0].verdict == "pass" and (.reason | test("cleanup after iteration 1"))'
+
+# --- verdict.sh: juju + scrub state -> verdict.json, job outputs ----------------------
+art="$tmp/art-jujustate"
+pipeline "$art" scenarios selftest 1
+printf '%s\n' juju_version=4.0.1 juju_git_commit=0123456789abcdef0123456789abcdef01234567 juju_snap_revision=31000 source=snap \
+	substrate_snap_name=lxd substrate_snap_channel=latest/candidate substrate_snap_revision=33000 \
+	tests_sha=0123456789abcdef0123456789abcdef01234567 tests_source=git-commit >"$art.state/juju.env"
+printf '%s\n' scrub_hits=2 upload_blocked=false upload_blocked_path= >"$art.state/scrub.env"
+: >"$art.vout"
+env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd \
+	VALIDATE_OUTCOME=success READY_OUTCOME=success SCENARIO_OUTCOME=success GITHUB_OUTPUT="$art.vout" \
+	bash scripts/verdict.sh >"$tmp/log" 2>&1
+check "verdict: juju.env + scrub.env fields" "$art" \
+	'.juju_version == "4.0.1" and .juju_snap_revision == 31000 and .tests_source == "git-commit" and .substrate_snap.revision == 33000 and .scrub_hits == 2 and .upload_blocked == false and .upload_blocked_path == null'
+if grep -qx 'scrub_hits=2' "$art.vout" && grep -qx 'upload_blocked=false' "$art.vout"; then pass "verdict: scrub outputs for the job result"; else bad "verdict scrub outputs"; cat "$art.vout"; fi
+art="$tmp/art-blocked"
+pipeline "$art" scenarios selftest-exit-1 1
+printf '%s\n' scrub_hits=0 upload_blocked=true upload_blocked_path=iteration-1.log >"$art.state/scrub.env"
+: >"$art.summary"
+env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd \
+	VALIDATE_OUTCOME=success READY_OUTCOME=success SCENARIO_OUTCOME=success GITHUB_STEP_SUMMARY="$art.summary" \
+	bash scripts/verdict.sh >"$tmp/log" 2>&1
+if jq -e '.verdict == "fail" and .upload_blocked == true and .upload_blocked_path == "iteration-1.log"' "$art/verdict.json" >/dev/null &&
+	grep -q 'Upload blocked' "$art.summary" && ! grep -q 'Last 50 lines' "$art.summary"; then
+	pass "verdict: blocked upload keeps the real verdict, no log excerpt in the summary"
+else
+	bad "verdict blocked"
+	cat "$art.summary"
+fi
+art="$tmp/art-setupreason"
+pipeline "$art" scenarios selftest 1
+echo "DEPS: unknown dependency 'nonexistent' (v1 vocabulary: charmcraft)" >"$art.state/setup-error.txt"
+env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd \
+	VALIDATE_OUTCOME=success READY_OUTCOME=skipped SCENARIO_OUTCOME=skipped bash scripts/verdict.sh >"$tmp/log" 2>&1
+check "verdict: setup failure reason from setup-error.txt" "$art" '.verdict == "setup-error" and (.reason | startswith("DEPS: unknown dependency"))'
+
+# --- deps.sh -----------------------------------------------------------------------
+rc=0
+env -i PATH="$PATH" LAB_STATE_DIR="$tmp/deps-state" LAB_DEPS=nonexistent bash scripts/deps.sh >"$tmp/log" 2>&1 || rc=$?
+if [[ $rc == 2 ]] && grep -q "unknown dependency 'nonexistent'" "$tmp/deps-state/setup-error.txt"; then pass "deps: unknown dep -> exit 2 with reason"; else bad "deps unknown: rc $rc"; cat "$tmp/log"; fi
 
 exit "$status"

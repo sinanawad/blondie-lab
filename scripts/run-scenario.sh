@@ -6,6 +6,12 @@
 # it into the artifact) and stops after an infra error (2) or an error (any exit
 # other than 0/1/2/3). Always exits 0: verdict.sh decides.
 #
+# With LAB_NEEDS_JUJU=1, every non-controller model is destroyed between
+# iterations (cleanup-models.sh, one 5 min budget; cleanup_s records it). A
+# cleanup that doesn't finish stops the loop as setup-error ($LAB_STATE_DIR/stop.env).
+# suite.sh reports a matched infra signature through $LAB_SIGNAL_FILE; it is
+# accepted only with exit 2 and recorded in $LAB_STATE_DIR/infra-signature.txt.
+#
 # Isolation: the scenario gets no GITHUB_ENV/OUTPUT/PATH/STATE/STEP_SUMMARY and no
 # LAB_STATE_DIR, and its output is replayed into the step log between
 # ::stop-commands:: markers, so it can't issue workflow commands.
@@ -22,9 +28,18 @@ kill_grace=${LAB_KILL_GRACE:-60}
 [[ $kill_grace =~ ^[0-9]+$ ]] || { echo "::error::bad LAB_KILL_GRACE"; exit 0; }
 
 dir="${LAB_SCENARIOS_DIR:-scenarios}/$LAB_SCENARIO"
+# juju/juju smoke.yml sets MODEL_ARCH for the suites (design §3); snap mode has no Go.
+if [[ ${LAB_NEEDS_JUJU:-0} == 1 && -z ${MODEL_ARCH:-} ]]; then
+	MODEL_ARCH=$(dpkg --print-architecture 2>/dev/null || true)
+	export MODEL_ARCH
+fi
 results="$LAB_STATE_DIR/results.jsonl"
+here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$LAB_ARTIFACT_DIR" "$LAB_STATE_DIR"
 : >"$results"
+rm -f "$LAB_STATE_DIR/stop.env" "$LAB_STATE_DIR/infra-signature.txt"
+sigdir=$(mktemp -d)
+trap 'rm -rf "$sigdir"' EXIT
 
 verdict_of() {
 	case $1 in
@@ -41,8 +56,9 @@ for ((i = 1; i <= LAB_REPEAT; i++)); do
 	echo "::group::iteration $i/$LAB_REPEAT"
 	start=$(date +%s)
 	rc=0
+	sig="$sigdir/signal-$i"
 	env -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
-		-u LAB_STATE_DIR LAB_ITERATION="$i" LAB_SCENARIO_DIR="$dir" \
+		-u LAB_STATE_DIR LAB_ITERATION="$i" LAB_SCENARIO_DIR="$dir" LAB_SIGNAL_FILE="$sig" \
 		timeout -k "$kill_grace" "$iter_timeout" bash "$dir/run.sh" >"$log" 2>&1 </dev/null || rc=$?
 	duration=$(($(date +%s) - start))
 	tok=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
@@ -51,15 +67,28 @@ for ((i = 1; i <= LAB_REPEAT; i++)); do
 	echo "::$tok::"
 	echo "::endgroup::"
 	v=$(verdict_of "$rc")
-	# Cleanup between iterations (destroy models, wait for k8s namespaces) lands
-	# with the Juju substrates in PR-3/PR-4; cleanup_s is 0 until then.
+	if [[ $rc == 2 && -s $sig && ! -s $LAB_STATE_DIR/infra-signature.txt ]]; then
+		head -n 1 "$sig" | cut -c1-500 >"$LAB_STATE_DIR/infra-signature.txt"
+		echo "iteration $i: infra signature: $(cat "$LAB_STATE_DIR/infra-signature.txt")"
+	fi
+	stop=""
+	[[ $v == setup-error || $v == error ]] && stop=$v
 	cleanup_s=0
+	if [[ -z $stop && $i -lt $LAB_REPEAT && ${LAB_NEEDS_JUJU:-0} == 1 ]]; then
+		c0=$(date +%s)
+		if ! timeout -k 10 "${LAB_CLEANUP_TIMEOUT:-300}" "$here/cleanup-models.sh" >"$LAB_ARTIFACT_DIR/cleanup-$i.log" 2>&1; then
+			stop=cleanup
+			printf 'stop=cleanup\niteration=%s\n' "$i" >"$LAB_STATE_DIR/stop.env"
+		fi
+		cleanup_s=$(($(date +%s) - c0))
+		echo "cleanup after iteration $i: ${cleanup_s}s${stop:+ (did not finish)}"
+	fi
 	jq -cn --argjson i "$i" --argjson rc "$rc" --arg v "$v" \
 		--argjson d "$duration" --argjson c "$cleanup_s" \
 		'{iteration: $i, exit_code: $rc, verdict: $v, duration_s: $d, cleanup_s: $c}' >>"$results"
 	echo "iteration $i: exit $rc -> $v (${duration}s)"
-	if [[ $v == setup-error || $v == error ]]; then
-		echo "stopping after iteration $i ($v)"
+	if [[ -n $stop ]]; then
+		echo "stopping after iteration $i ($stop)"
 		break
 	fi
 done

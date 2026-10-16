@@ -102,6 +102,7 @@ done <"$dir/scenario.env"
 [[ -n $SUBSTRATE ]] || fail "scenario.env: SUBSTRATE is required"
 [[ -n $TIMEOUT_MIN ]] || fail "scenario.env: TIMEOUT_MIN is required"
 ok needs_juju "$NEEDS_JUJU"
+ok needs_tests "$NEEDS_TESTS"
 [[ $SUBSTRATE == any || $SUBSTRATE == "$substrate" ]] ||
 	fail "scenario $scenario needs SUBSTRATE=$SUBSTRATE, this workflow is $substrate"
 
@@ -121,9 +122,12 @@ if [[ $NEEDS_JUJU == 0 ]]; then
 else
 	[[ $NEEDS_TESTS == 1 || -z $tests_ref ]] || fail "tests_ref: not used by scenario $scenario (NEEDS_TESTS=0)"
 	# Not implemented yet: these fail as setup-error rather than doing something partial.
+	[[ $substrate == lxd ]] || fail "scenario $scenario needs Juju; the $substrate substrate is not implemented yet (plan PR-4)"
 	[[ -z $ref ]] || fail "ref: build mode is not implemented yet (plan PR-5)"
-	fail "scenario $scenario needs Juju; the $substrate substrate is not implemented yet (plan PR-3/PR-4)"
-	# PR-3: DEPS and NEEDS_TESTS=1 gates ("not implemented yet") go here once Juju runs.
+	# An explicit tests_ref runs code from that ref in the job, so it needs the
+	# ref trust check (design §8), which lands with build mode.
+	[[ -z $tests_ref ]] || fail "tests_ref: an explicit tests_ref needs the ref trust check (plan PR-5); omit it to use the snap's git-commit"
+	# DEPS words are checked against the deps.sh vocabulary during setup (exit 2 there).
 fi
 
 {
@@ -132,5 +136,8 @@ fi
 	echo "scenario_timeout=$scenario_timeout"
 	echo "timeout_min=$TIMEOUT_MIN"
 	echo "needs_juju=$NEEDS_JUJU"
+	echo "needs_tests=$NEEDS_TESTS"
+	echo "deps=$DEPS"
+	echo "juju_channel=$channel"
 } >>"$OUT"
 echo "validate: ok (scenario=$scenario substrate=$substrate repeat=$repeat TIMEOUT_MIN=$TIMEOUT_MIN scenario_timeout=$scenario_timeout)"

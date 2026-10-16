@@ -28,6 +28,18 @@ if [[ -f $STATE_DIR/valid.env ]]; then
 	done <"$STATE_DIR/valid.env"
 fi
 has() { [[ -n ${val[$1]+x} ]]; }
+# Harness-written key=value state from setup (juju.env), scrub (scrub.env) and
+# the loop (stop.env); parsed, never sourced.
+declare -A st=()
+for f in juju.env scrub.env stop.env; do
+	[[ -f $STATE_DIR/$f ]] || continue
+	while IFS= read -r line; do
+		[[ $line =~ ^([a-z_]+)=(.*)$ ]] && st[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+	done <"$STATE_DIR/$f"
+done
+s_() { printf '%s' "${st[$1]:-}"; }
+infra_signature=""
+[[ -s $STATE_DIR/infra-signature.txt ]] && infra_signature=$(head -n 1 "$STATE_DIR/infra-signature.txt")
 repeat=${val[repeat]:-}
 reason=""
 
@@ -39,7 +51,11 @@ elif [[ ${READY_OUTCOME:-} != success ]]; then
 	# A step between validate and ready (substrate setup, bootstrap: PR-3/PR-4)
 	# failed or was skipped: design §4 maps this to setup-error before the scenario runs.
 	verdict=setup-error
-	reason="setup did not complete (ready step: ${READY_OUTCOME:-unknown})"
+	if [[ -s $STATE_DIR/setup-error.txt ]]; then
+		reason=$(head -n 1 "$STATE_DIR/setup-error.txt")
+	else
+		reason="setup did not complete (ready step: ${READY_OUTCOME:-unknown})"
+	fi
 	: >"$results"
 elif [[ ! -s $results ]]; then
 	verdict=error
@@ -48,15 +64,22 @@ else
 	# Design §4 aggregation: fail beats everything; else a stop (setup-error or
 	# error) wins; else inconclusive; else pass. Fewer results than requested
 	# without a recorded stop means the step was cut short (timeout/cancel).
-	verdict=$(jq -rs --argjson n "$repeat" '
+	cleanup_stop=false
+	[[ ${st[stop]:-} == cleanup ]] && cleanup_stop=true
+	verdict=$(jq -rs --argjson n "$repeat" --argjson cleanup_stop "$cleanup_stop" '
 		(map(.verdict)) as $v
 		| if any($v[]; . == "fail") then "fail"
-		  elif any($v[]; . == "setup-error") then "setup-error"
+		  elif any($v[]; . == "setup-error") or $cleanup_stop then "setup-error"
 		  elif any($v[]; . == "error") then "error"
 		  elif length < $n then "error"
 		  elif any($v[]; . == "inconclusive") then "inconclusive"
 		  else "pass" end' "$results")
 	n_done=$(jq -s length "$results")
+	if [[ $verdict == setup-error && $cleanup_stop == true ]] && ! jq -se 'any(.[]; .verdict == "setup-error")' "$results" >/dev/null; then
+		reason="model cleanup after iteration ${st[iteration]:-?} did not finish within the budget"
+	elif [[ $verdict == setup-error && -n $infra_signature ]]; then
+		reason="infra signature in the suite setup phase: $infra_signature"
+	fi
 	if [[ $verdict == error && $n_done -lt $repeat ]] && ! jq -se 'any(.[]; .verdict == "error")' "$results" >/dev/null; then
 		reason="only $n_done of $repeat iterations recorded (scenario step: ${SCENARIO_OUTCOME:-unknown})"
 	fi
@@ -66,6 +89,8 @@ fi
 cp "$results" "$ARTIFACT_DIR/results.jsonl"
 [[ -f $STATE_DIR/validate-error.txt ]] && cp "$STATE_DIR/validate-error.txt" "$ARTIFACT_DIR/validate-error.txt"
 
+scrub_ran=false
+[[ -n ${st[scrub_hits]+x} ]] && scrub_ran=true
 no_juju=false
 [[ ${val[needs_juju]:-} == 0 ]] && no_juju=true
 j() { if has "$1"; then printf '%s' "${val[$1]}"; fi; }
@@ -78,23 +103,35 @@ jq -n \
 	--arg lab_sha "${GITHUB_SHA:-}" \
 	--arg runner_image "${ImageOS:-unknown}/${ImageVersion:-unknown}" \
 	--arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}" \
+	--arg juju_version "$(s_ juju_version)" --arg juju_git_commit "$(s_ juju_git_commit)" \
+	--arg juju_snap_revision "$(s_ juju_snap_revision)" --arg source "$(s_ source)" \
+	--arg tests_sha "$(s_ tests_sha)" --arg tests_source "$(s_ tests_source)" \
+	--arg sub_name "$(s_ substrate_snap_name)" --arg sub_channel "$(s_ substrate_snap_channel)" \
+	--arg sub_rev "$(s_ substrate_snap_revision)" \
+	--arg infra_signature "$infra_signature" \
+	--argjson scrub_ran "$scrub_ran" --arg scrub_hits "$(s_ scrub_hits)" \
+	--arg upload_blocked "$(s_ upload_blocked)" --arg upload_blocked_path "$(s_ upload_blocked_path)" \
 	--slurpfile results "$results" '
 	def v(x): if x != "" then x else null end;
 	{
 		schema_version: 1,
 		scenario: v($scenario), substrate: $substrate, verdict: $verdict,
 		reason: v($reason),
-		juju_version: null, juju_git_commit: null, juju_snap_revision: null,
+		juju_version: v($juju_version), juju_git_commit: v($juju_git_commit),
+		juju_snap_revision: (if $juju_snap_revision == "" then null else ($juju_snap_revision | tonumber) end),
 		juju_channel: (if $no_juju then null else v($channel) end),
-		source: (if $no_juju then "none" else null end),
+		source: (if $no_juju then "none" else v($source) end),
 		ref: v($ref), ref_sha: null,
-		tests_ref: v($tests_ref), tests_sha: null, tests_source: null,
-		lab_sha: $lab_sha, runner_image: $runner_image, substrate_snap: null,
+		tests_ref: v($tests_ref), tests_sha: v($tests_sha), tests_source: v($tests_source),
+		lab_sha: $lab_sha, runner_image: $runner_image,
+		substrate_snap: (if $sub_name == "" then null else {name: $sub_name, channel: v($sub_channel), revision: (if $sub_rev == "" then null else ($sub_rev | tonumber) end)} end),
 		iterations: (if $repeat == "" then null else ($repeat | tonumber) end),
 		failed: ($results | map(select(.verdict == "fail")) | length),
 		results: $results,
-		infra_signature: null, scrub_hits: null,
-		upload_blocked: false, upload_blocked_path: null,
+		infra_signature: v($infra_signature),
+		scrub_hits: (if $scrub_ran then ($scrub_hits | tonumber) else null end),
+		upload_blocked: ($upload_blocked == "true"),
+		upload_blocked_path: v($upload_blocked_path),
 		request_id: v($request_id), run_url: $run_url
 	}' >"$out"
 
@@ -108,6 +145,8 @@ fi
 {
 	echo "verdict=$verdict"
 	echo "artifact_name=$artifact_name"
+	echo "scrub_hits=$(jq -r '.scrub_hits // "none"' "$out")"
+	echo "upload_blocked=$(jq -r .upload_blocked "$out")"
 } >>"$OUT"
 
 # Job summary. Backticks are replaced so no value can close the code fence.
@@ -117,6 +156,12 @@ n_done=$(jq '.results | length' "$out")
 	echo "## lab verdict: \`$verdict\`"
 	echo
 	[[ -n $reason ]] && echo "Reason: $(printf '%s' "$reason" | tr '`' "'")" && echo
+	[[ -n $infra_signature ]] && echo "Infra signature (setup phase, reclassified to setup-error): $(printf '%s' "$infra_signature" | tr '`' "'")" && echo
+	if [[ ${st[upload_blocked]:-} == true ]]; then
+		echo "**Upload blocked:** private key material in \`$(printf '%s' "${st[upload_blocked_path]:-?}" | tr '`' "'")\`; only verdict.json + collect.log were uploaded." && echo
+	elif [[ $scrub_ran == true && ${st[scrub_hits]:-0} != 0 ]]; then
+		echo "**Scrub:** ${st[scrub_hits]} value(s) redacted; the job is red so a human looks." && echo
+	fi
 	echo "Failed iterations: $n_fail/$n_done recorded (requested: ${repeat:-?})"
 	echo
 	echo '```json'
@@ -124,7 +169,8 @@ n_done=$(jq '.results | length' "$out")
 	echo '```'
 	# Design §7: show the first failing iteration, else the first non-pass one.
 	first_bad=$(jq -r '([.results[] | select(.verdict == "fail")][0] // [.results[] | select(.verdict != "pass")][0]).iteration // empty' "$out")
-	if [[ -n $first_bad && -f $ARTIFACT_DIR/iteration-$first_bad.log ]]; then
+	# No excerpt when the upload was blocked: the log may hold the key material.
+	if [[ -n $first_bad && -f $ARTIFACT_DIR/iteration-$first_bad.log && ${st[upload_blocked]:-} != true ]]; then
 		echo
 		echo "Last 50 lines of iteration $first_bad:"
 		echo '```'
