@@ -1,4 +1,4 @@
 - **Note:** `test_model_multi` and `test_model_destroy` create several models; the teardown check covers them. `test_model_metrics` is skipped (see above).
-- **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name.
+- **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name. `run.sh` exports `DESTROY_TIMEOUT=5m` (main.sh default 15m) and `TIMEOUT_MIN` keeps 10 min for this check, so a hung destroy scores `fail`, not `error`.
 - **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
 - **Expected verdict:** `pass` on a healthy channel.
