@@ -87,6 +87,9 @@ fi
 # suites run non-interactively (relations: "Continue [y/N]? ERROR unit
 # removal: aborted").
 extra+=(--model-default mode=)
+# Recorded (verdict.bootstrap_args): every scenario's models start without
+# prompts; a repro that needs them sets `juju model-config mode=requires-prompts`.
+state_set bootstrap_args "${extra[*]}${BOOTSTRAP_ADDITIONAL_ARGS:+ $BOOTSTRAP_ADDITIONAL_ARGS}"
 # BOOTSTRAP_ADDITIONAL_ARGS is a fixed string from the workflow (copied from
 # juju/juju smoke.yml), split on purpose.
 # shellcheck disable=SC2086

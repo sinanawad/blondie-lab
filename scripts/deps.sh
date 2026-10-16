@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Preflights the tools juju/juju tests/main.sh needs (curl, yq, shellcheck) and
-# installs the scenario's DEPS from scripts/deps-vocab.txt (pinned channel;
-# channel and revision recorded as dep_<name>=<channel> <revision>). Any
+# installs the scenario's DEPS from scripts/deps-vocab.txt (pinned channel,
+# refresh held; channel and revision recorded as dep_<name>=<channel> <revision>). Any
 # missing or failed dependency is exit 2 (setup-error), never 1.
 set -euo pipefail
 export LC_ALL=C
@@ -27,6 +27,7 @@ for d in $deps; do
 		;;
 	*) setup_fail "DEPS: '$d' is in the vocabulary but deps.sh can't install it" ;;
 	esac
+	hold_refresh "$d"
 	rev=$(snap list "$d" | awk 'NR == 2 { print $3 }')
 	[[ $rev =~ ^[0-9]+$ ]] || setup_fail "DEPS: no snap revision for $d"
 	state_set "dep_$d" "$channel $rev"

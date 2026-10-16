@@ -46,7 +46,12 @@ if [[ -n ${LAB_STATE_DIR:-} && -f $LAB_STATE_DIR/juju.env ]]; then
 	drift=""
 	rec() { sed -n "s/^$1=//p" "$LAB_STATE_DIR/juju.env" | tail -n 1; }
 	sub=$(rec substrate_snap_name)
-	for pair in "juju $(rec juju_snap_revision)" "${sub:-} $(rec substrate_snap_revision)"; do
+	pairs=("juju $(rec juju_snap_revision)" "${sub:-} $(rec substrate_snap_revision)")
+	# DEPS snaps and LXD-for-charmcraft (dep_<snap>=<channel> <revision>), held too.
+	while IFS='=' read -r k v; do
+		[[ $k == dep_* ]] && pairs+=("${k#dep_} ${v##* }")
+	done <"$LAB_STATE_DIR/juju.env"
+	for pair in "${pairs[@]}"; do
 		read -r snapn want <<<"$pair"
 		[[ -n ${snapn:-} && -n ${want:-} ]] || continue
 		now=$(timeout 30 snap list "$snapn" 2>/dev/null | awk 'NR == 2 {print $3}')
@@ -83,7 +88,11 @@ else
 	echo "juju or controller '$controller' not available; skipping juju collection" >>"$LOG"
 fi
 
-if [[ ${LAB_SUBSTRATE:-} == lxd ]] && command -v lxc >/dev/null; then
+# LXD: the substrate, or set up for charmcraft on k8s (dep_lxd recorded).
+lxd_used=0
+[[ ${LAB_SUBSTRATE:-} == lxd ]] && lxd_used=1
+[[ -n ${LAB_STATE_DIR:-} && -f $LAB_STATE_DIR/juju.env ]] && grep -q '^dep_lxd=' "$LAB_STATE_DIR/juju.env" && lxd_used=1
+if ((lxd_used)) && command -v lxc >/dev/null; then
 	c 60 lxd/list.txt lxc list
 	names=$(timeout 60 lxc list --format=json 2>>"$LOG" | jq -r '.[] | "\(.name) \(.status)"' 2>>"$LOG")
 	while read -r name status; do

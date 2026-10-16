@@ -20,10 +20,12 @@ kubectl="$here/lab-kubectl"
 # Every user's models (--all; the lab user is the controller admin), by
 # qualified name (<qualifier>/<model>), so a suite that creates models as or
 # for another user can't leave them behind unseen, and two users' models with
-# the same short name are destroyed separately.
+# the same short name are destroyed separately. Only the controller model is
+# excluded (is-controller, or exactly admin/controller): another user's model
+# named "controller" (bob/controller) is destroyed like any other.
 models() {
 	timeout 60 juju models --all -c "$controller" --format=json |
-		jq -r '.models // [] | .[] | select(((."is-controller") | tostring) != "true" and ."short-name" != "controller") | (if (.name // "") | contains("/") then .name else ."short-name" end)'
+		jq -r '.models // [] | .[] | select(((."is-controller") | tostring) != "true") | (if (.name // "") | contains("/") then .name else ."short-name" end) | select(. != "admin/controller" and . != "controller")'
 }
 # Namespaces of juju models (label model.juju.is/name, not "controller").
 model_namespaces() {

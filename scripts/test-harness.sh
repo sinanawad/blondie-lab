@@ -437,6 +437,9 @@ suite_case() {
 	fi
 }
 # TMPDIR for the suite: inside the tests checkout, not /tmp (snap juju can't read /tmp).
+# This only asserts the value; it can't model the snap's private /tmp. The live
+# cli-basics run (cli model_config/model_defaults hand mktemp files to juju) is
+# the real test.
 td="$tmp/tests-tmpdir"
 mkdir -p "$td"
 cat >"$td/main.sh" <<'FAKE'
@@ -646,11 +649,13 @@ cleanup_run nslxd LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
 if ((crc == 0)) && ! grep -q kubectl "$tmp/fake.log"; then pass "cleanup lxd: no namespace wait"; else bad "cleanup lxd (rc $crc)"; cat "$tmp/nslxd.out"; fi
 # All users' models, by qualified name: another user's model with the same
 # short name is destroyed too, and separately.
-printf '%s\n' admin/m1 bob/m1 >"$tmp/fake.models"
+printf '%s\n' admin/m1 bob/m1 bob/controller >"$tmp/fake.models"
 cleanup_run allusers LAB_SUBSTRATE=lxd LAB_CLEANUP_TIMEOUT=3
 if ((crc == 0)) && grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:admin/m1' "$tmp/fake.log" &&
-	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/m1' "$tmp/fake.log" && [[ ! -s $tmp/fake.models ]]; then
-	pass "cleanup: models --all, every user's model destroyed by qualified name"
+	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/m1' "$tmp/fake.log" &&
+	grep -qx 'destroy destroy-model --no-prompt --force --no-wait --destroy-storage lab:bob/controller' "$tmp/fake.log" &&
+	! grep -q 'lab:admin/controller' "$tmp/fake.log" && [[ ! -s $tmp/fake.models ]]; then
+	pass "cleanup: models --all, every user's model destroyed by qualified name (bob/controller too, never admin/controller)"
 else
 	bad "cleanup all users (rc $crc)"
 	cat "$tmp/allusers.out" "$tmp/fake.log"
@@ -724,7 +729,12 @@ else
 	bad "bootstrap k8s images (rc $brc)"
 	cat "$b.out" "$b.state/juju.env"
 fi
-if grep -q -- '--model-default mode=' "$tmp/boot-args"; then pass "bootstrap: --model-default mode= (no confirmation prompts, as juju/juju tests)"; else bad "bootstrap without mode="; cat "$tmp/boot-args"; fi
+if grep -q -- '--model-default mode=' "$tmp/boot-args" && grep -qx 'bootstrap_args=--model-default mode=' "$b.state/juju.env"; then
+	pass "bootstrap: --model-default mode= (no confirmation prompts, as juju/juju tests), recorded as bootstrap_args"
+else
+	bad "bootstrap without mode= or not recorded"
+	cat "$tmp/boot-args" "$b.state/juju.env"
+fi
 boot_ok otherimg LAB_JUJU_SOURCE=snap FAKE_API_IMAGE=example.com/x/jujud-operator:4.0.15
 if ((brc == 0)) && grep -qx agent_source=unknown "$b.state/juju.env"; then pass "bootstrap k8s: other image repo -> agent_source unknown"; else bad "bootstrap k8s other repo (rc $brc)"; cat "$b.out"; fi
 boot_ok snapnoplug LAB_JUJU_SOURCE=snap FAKE_NO_SNAP=1
@@ -769,9 +779,12 @@ declare -A paths=(
 	[k8s-build]='Set up LXD|Wait for LXD|Install juju snap|Bootstrap (LXD build mode)'
 	[lxd-snap]="Set up MicroK8s|$bm"
 	[k8s-snap]="Set up LXD|Wait for LXD|$bm"
+	# k8s with DEPS=charmcraft also runs "Set up LXD" + "Wait for LXD".
+	[k8s-build+charmcraft]='Install juju snap|Bootstrap (LXD build mode)'
+	[k8s-snap+charmcraft]="$bm"
 )
 worst=0
-for pth in lxd-build k8s-build lxd-snap k8s-snap; do
+for pth in lxd-build k8s-build lxd-snap k8s-snap k8s-build+charmcraft k8s-snap+charmcraft; do
 	sum=$(path_sum "${paths[$pth]}")
 	((sum > worst)) && worst=$sum
 	if [[ $job_tm =~ ^[0-9]+$ ]] && ((sum <= job_tm)); then :; else bad "budget: $pth step timeouts sum to $sum min > job timeout-minutes ${job_tm:-unset}"; fi
@@ -822,6 +835,16 @@ if ((nrc == 1)) && grep -qx 'drill: suite passed but its teardown left models af
 else
 	bad "no-models-left other user (rc $nrc)"
 	cat "$tmp/nmlother.out"
+fi
+# Only the controller model itself is excluded: another user's model named
+# "controller" is a leftover like any other.
+echo bob/controller >"$tmp/fake.models"
+nml nmlbobctl LAB_SUBSTRATE=lxd
+if ((nrc == 1)) && grep -qx 'drill: suite passed but its teardown left models after 3s: bob/controller' "$tmp/nmlbobctl.out"; then
+	pass "no-models-left: bob/controller is not the controller model -> fail"
+else
+	bad "no-models-left bob/controller (rc $nrc)"
+	cat "$tmp/nmlbobctl.out"
 fi
 : >"$tmp/fake.models"
 
@@ -1194,7 +1217,8 @@ fi
 # Agent, deps, branch warning, bootstrap excerpt.
 art="$tmp/art-agent"
 pipeline "$art" scenarios selftest 1
-printf '%s\n' controller_agent_version=4.0.15 agent_source=packaged 'dep_charmcraft=4.x/stable 8265' \
+printf '%s\n' controller_agent_version=4.0.15 agent_source=packaged 'dep_charmcraft=4.x/stable 8265' 'dep_lxd=5.21/stable 33110' \
+	'bootstrap_args=--model-default mode=' \
 	tests_sha=0123456789abcdef0123456789abcdef01234567 tests_source=branch bootstrap_failed=1 >"$art.state/juju.env"
 printf '%s\n' scrub_hits=0 upload_blocked=false upload_blocked_path= scrub_dropped=0 scrub_withheld=0 >"$art.state/scrub.env"
 mkdir -p "$art/collect" && printf 'boot line %s\n' 1 2 3 >"$art/collect/bootstrap.log"
@@ -1202,8 +1226,8 @@ mkdir -p "$art/collect" && printf 'boot line %s\n' 1 2 3 >"$art/collect/bootstra
 env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_UPLOAD_DIR="$art" LAB_SUBSTRATE=lxd \
 	VALIDATE_OUTCOME=success READY_OUTCOME=skipped SCENARIO_OUTCOME=skipped GITHUB_STEP_SUMMARY="$art.summary" \
 	bash scripts/verdict.sh >"$tmp/log" 2>&1
-check "verdict: controller_agent_version, agent_source, deps [{name, channel, revision}]" "$art" \
-	'.controller_agent_version == "4.0.15" and .agent_source == "packaged" and .deps == [{"name":"charmcraft","channel":"4.x/stable","revision":8265}] and .scrub_dropped == 0'
+check "verdict: controller_agent_version, agent_source, deps [{name, channel, revision}] incl. LXD for charmcraft, bootstrap_args" "$art" \
+	'.controller_agent_version == "4.0.15" and .agent_source == "packaged" and .deps == [{"name":"charmcraft","channel":"4.x/stable","revision":8265},{"name":"lxd","channel":"5.21/stable","revision":33110}] and .bootstrap_args == "--model-default mode=" and .scrub_dropped == 0'
 if grep -q '^\*\*Warning:\*\* tests/ came from the branch head' "$art.summary" && grep -q 'Last 30 lines of collect/bootstrap.log' "$art.summary" && grep -qx 'boot line 3' "$art.summary"; then
 	pass "summary: branch tests warning and bootstrap log excerpt"
 else
@@ -1272,8 +1296,10 @@ esac
 FAKE
 cat >"$fo/sg" <<'FAKE'
 #!/usr/bin/env bash
-cat >/dev/null
+# Only the import reads stdin (docker save | sg ...). Reading it for `images ls`
+# too blocked on a terminal stdin until `timeout 60` (box-only failure).
 case $3 in
+*"image import"*) cat >/dev/null ;;
 *"images ls"*) echo "REF TYPE DIGEST"; echo "$LAB_OPERATOR_IMAGE application/x sha256:$(printf 'd%.0s' {1..64})" ;;
 esac
 FAKE
