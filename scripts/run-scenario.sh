@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
 # Runs scenarios/$LAB_SCENARIO/run.sh LAB_REPEAT times. Each iteration is a fresh
-# bash process under `timeout -k 60 <TIMEOUT_MIN>m`, so no exported state leaks
-# between iterations and one hang can't eat the step. Appends one JSON line per
-# iteration to $LAB_ARTIFACT_DIR/results.jsonl and stops after an infra error (2)
-# or an error (any exit other than 0/1/2/3). Always exits 0: verdict.sh decides.
+# bash process under `timeout -k <grace> <TIMEOUT_MIN>m`, so no exported state
+# leaks between iterations and one hang can't eat the step. Appends one JSON line
+# per iteration to $LAB_STATE_DIR/results.jsonl (harness-owned; verdict.sh copies
+# it into the artifact) and stops after an infra error (2) or an error (any exit
+# other than 0/1/2/3). Always exits 0: verdict.sh decides.
+#
+# Isolation: the scenario gets no GITHUB_ENV/OUTPUT/PATH/STATE/STEP_SUMMARY and no
+# LAB_STATE_DIR, and its output is replayed into the step log between
+# ::stop-commands:: markers, so it can't issue workflow commands.
+# (Same OS user, so this is integrity against accidents and naive output, not a
+# sandbox.)
 set -euo pipefail
 export LC_ALL=C
 
-: "${LAB_SCENARIO:?}" "${LAB_REPEAT:?}" "${LAB_TIMEOUT_MIN:?}" "${LAB_ARTIFACT_DIR:?}"
+: "${LAB_SCENARIO:?}" "${LAB_REPEAT:?}" "${LAB_TIMEOUT_MIN:?}" "${LAB_ARTIFACT_DIR:?}" "${LAB_STATE_DIR:?}"
+# Test-only knobs (test-harness.sh); the workflow never sets them.
+iter_timeout=${LAB_ITER_TIMEOUT:-${LAB_TIMEOUT_MIN}m}
+kill_grace=${LAB_KILL_GRACE:-60}
+[[ $iter_timeout =~ ^[0-9]+[sm]$ ]] || { echo "::error::bad LAB_ITER_TIMEOUT"; exit 0; }
+[[ $kill_grace =~ ^[0-9]+$ ]] || { echo "::error::bad LAB_KILL_GRACE"; exit 0; }
+
 dir="${LAB_SCENARIOS_DIR:-scenarios}/$LAB_SCENARIO"
-results="$LAB_ARTIFACT_DIR/results.jsonl"
-mkdir -p "$LAB_ARTIFACT_DIR"
+results="$LAB_STATE_DIR/results.jsonl"
+mkdir -p "$LAB_ARTIFACT_DIR" "$LAB_STATE_DIR"
 : >"$results"
 
 verdict_of() {
@@ -28,10 +41,14 @@ for ((i = 1; i <= LAB_REPEAT; i++)); do
 	echo "::group::iteration $i/$LAB_REPEAT"
 	start=$(date +%s)
 	rc=0
-	LAB_ITERATION=$i LAB_SCENARIO_DIR=$dir \
-		timeout -k 60 "${LAB_TIMEOUT_MIN}m" bash "$dir/run.sh" >"$log" 2>&1 || rc=$?
+	env -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
+		-u LAB_STATE_DIR LAB_ITERATION="$i" LAB_SCENARIO_DIR="$dir" \
+		timeout -k "$kill_grace" "$iter_timeout" bash "$dir/run.sh" >"$log" 2>&1 </dev/null || rc=$?
 	duration=$(($(date +%s) - start))
+	tok=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+	echo "::stop-commands::$tok"
 	cat "$log"
+	echo "::$tok::"
 	echo "::endgroup::"
 	v=$(verdict_of "$rc")
 	# Cleanup between iterations (destroy models, wait for k8s namespaces) lands
