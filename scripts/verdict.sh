@@ -106,6 +106,30 @@ images_json=$(jq -ce 'if type == "array" and all(.[]; type == "object") then . e
 deps_json=$(for k in "${!st[@]}"; do if [[ $k == dep_* ]]; then printf '%s %s\n' "${k#dep_}" "${st[$k]}"; fi; done |
 	sort | jq -Rsc 'split("\n") | map(select(length > 0) | split(" ") | {name: .[0], channel: .[1], revision: (.[2] | tonumber? // null)})')
 
+# Build mode (design §3): build timings, GOMODCACHE size and cache use, and on
+# k8s the imported operator image. Cache values come from the restore step's
+# outputs (BUILD_CACHE_HIT/BUILD_CACHE_KEY), checked against the key format.
+src_=$(s_ source)
+[[ -n $src_ ]] || src_=${val[source]:-}
+num() { if [[ $1 =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf null; fi; }
+cache_key=${BUILD_CACHE_KEY:-}
+[[ $cache_key =~ ^gomod-4\.[0-9]+-[0-9a-f]{64}$ ]] || cache_key=""
+cache_hit=null
+case ${BUILD_CACHE_HIT:-} in true) cache_hit=true ;; false) cache_hit=false ;; esac
+build_json=null
+if [[ $src_ == build ]]; then
+	build_json=$(jq -nc --arg ref_version "$(s_ ref_version)" \
+		--argjson build_s "$(num "$(s_ build_s)")" --argjson go_install_s "$(num "$(s_ build_go_install_s)")" \
+		--argjson operator_image_s "$(num "$(s_ build_operator_image_s)")" --argjson gomodcache_mb "$(num "$(s_ gomodcache_mb)")" \
+		--argjson cache_hit "$cache_hit" --arg cache_key "$cache_key" \
+		--arg img "$(s_ operator_image)" --arg cfg "$(s_ operator_image_config)" --arg tgt "$(s_ operator_image_target)" '
+		def v(x): if x != "" then x else null end;
+		{ref_version: v($ref_version), build_s: $build_s, go_install_s: $go_install_s,
+		 operator_image_s: $operator_image_s, gomodcache_mb: $gomodcache_mb,
+		 gomod_cache: {exact_hit: $cache_hit, matched_key: v($cache_key)},
+		 operator_image: (if $img == "" then null else {image: $img, config_digest: v($cfg), target_digest: v($tgt)} end)}')
+fi
+
 # Harness state goes into the artifact as written by the harness.
 cp "$results" "$ARTIFACT_DIR/results.jsonl"
 [[ -f $STATE_DIR/validate-error.txt ]] && cp "$STATE_DIR/validate-error.txt" "$ARTIFACT_DIR/validate-error.txt"
@@ -125,7 +149,8 @@ jq -n \
 	--arg runner_image "${ImageOS:-unknown}/${ImageVersion:-unknown}" \
 	--arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}" \
 	--arg juju_version "$(s_ juju_version)" --arg juju_git_commit "$(s_ juju_git_commit)" \
-	--arg juju_snap_revision "$(s_ juju_snap_revision)" --arg source "$(s_ source)" \
+	--arg juju_snap_revision "$(s_ juju_snap_revision)" --arg source "$src_" \
+	--arg ref_sha "$(s_ ref_sha)" --argjson build "$build_json" \
 	--arg tests_sha "$(s_ tests_sha)" --arg tests_source "$(s_ tests_source)" \
 	--arg sub_name "$(s_ substrate_snap_name)" --arg sub_channel "$(s_ substrate_snap_channel)" \
 	--arg sub_rev "$(s_ substrate_snap_revision)" \
@@ -143,11 +168,11 @@ jq -n \
 		reason: v($reason),
 		juju_version: v($juju_version), juju_git_commit: v($juju_git_commit),
 		juju_snap_revision: (if $juju_snap_revision == "" then null else ($juju_snap_revision | tonumber) end),
-		juju_channel: (if $no_juju then null else v($channel) end),
+		juju_channel: (if $no_juju or $source == "build" then null else v($channel) end),
 		controller_agent_version: v($agent), agent_source: v($agent_source),
 		controller_images: $images,
 		source: (if $no_juju then "none" else v($source) end),
-		ref: v($ref), ref_sha: null,
+		ref: v($ref), ref_sha: v($ref_sha), build: $build,
 		tests_ref: v($tests_ref), tests_sha: v($tests_sha), tests_source: v($tests_source),
 		lab_sha: $lab_sha, runner_image: $runner_image,
 		deps: $deps,
