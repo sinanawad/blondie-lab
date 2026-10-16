@@ -224,6 +224,8 @@ jobs:
         run: scripts/resolve-tests.sh
 
       # Snap mode or an explicit tests_ref; build mode otherwise uses juju-src/tests.
+      # testcharms/ too: suites pack local charms from ./testcharms/charms/*
+      # (relations, hooks, sidecar, deploy, storage).
       - name: Checkout juju/juju tests
         id: tests_checkout
         if: steps.validate.outputs.needs_tests == '1' && steps.tests.outputs.tests_checkout == '1'
@@ -233,7 +235,9 @@ jobs:
           repository: juju/juju
           ref: ${{ steps.tests.outputs.tests_sha }}
           path: juju-tests
-          sparse-checkout: tests
+          sparse-checkout: |
+            tests
+            testcharms
           fetch-depth: 1
           persist-credentials: false
 
