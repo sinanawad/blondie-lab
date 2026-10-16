@@ -1,0 +1,6 @@
+# Models secrets_k8s creates and never destroys. Upstream relies on
+# KILL_CONTROLLER=true, which on the reused lab controller only destroys
+# test-secrets-k8s. Seen in run 38906319543 (4.0/stable, v4.0.15).
+multiple-secrets-parallel-k8s-model
+model-secrets-offer
+model-secrets-consume

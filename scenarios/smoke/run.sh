@@ -5,6 +5,10 @@
 # `destroy-model ... || true` on a reused controller, so this checks it: after
 # a pass, every non-controller model must be gone within 10 min, else fail.
 set -euo pipefail
+# The suite's own destroy_model waits DESTROY_TIMEOUT (main.sh default 15m);
+# 5m keeps a hung destroy inside TIMEOUT_MIN, so no-models-left.sh scores it
+# fail rather than the iteration timeout scoring it error.
+export DESTROY_TIMEOUT=5m
 rc=0
 "$LAB_ROOT/scripts/suite.sh" -s test_build smoke || rc=$?
 ((rc == 0)) || exit "$rc"
