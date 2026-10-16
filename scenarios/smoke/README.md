@@ -5,4 +5,4 @@
 - **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
 - **Skip:** `test_build` runs `make go-build` on the full juju tree; snap mode only checks out `tests/`, and building is not what this scenario tests.
 - **Expected verdict:** `pass` on a healthy channel. Also the scrub zero-hit baseline (design §8): a clean run must show `scrub_hits: 0`.
-- **Budget:** `TIMEOUT_MIN=25` (measured: deploy ~2 min, job ~12 min; final number at calibration, plan PR-6).
+- **Budget:** `TIMEOUT_MIN=10` per iteration (calibration: `docs/calibration.md`; scenario 154 s on 4.0/stable).

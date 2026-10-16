@@ -5,4 +5,5 @@
 - **Teardown check:** as in `smoke`, after a pass every non-controller model must be gone within 10 min, else `fail`. Between iterations (`repeat`) the harness also waits for each model namespace to be gone (shared 5 min cleanup budget).
 - **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
 - **Expected verdict:** `pass` on a healthy channel.
-- **Budget:** `TIMEOUT_MIN=20` (design estimate; final number at calibration, plan PR-6).
+- **Budget:** `TIMEOUT_MIN=10` per iteration (calibration: `docs/calibration.md`; scenario 116 s on 4.0/stable).
+- **3.6/stable:** juju 3.6 has no `smoke_k8s` suite and its `tests/main.sh` needs `expect`, so run it with `tests_ref=v4.0.15` (run 38919894631: verdict `pass`, built-in `microk8s` cloud, agent 3.6.29). The job is still red: the 3.6 (mongo) controller logs `tlsCertificateKeyFilePassword=ignored`, a literal placeholder (juju v3.6.29 `mongo/service.go`), which counts as 3 `scrub_hits` (redacted).

@@ -8,14 +8,15 @@
   - `test_local_charms`
   - `test_model_config` (run_model_config_isomorphic, run_model_config_cloudinit_userdata)
   - `test_model_defaults` (run_model_defaults_isomorphic, run_model_defaults_cloudinit_userdata, run_model_defaults_boolean, run_model_defaults_region_aws)
-  - ~~`test_model_constraints`~~ **skipped** (run_model_constraints): runs set-model-constraints on the *current* model. Earlier, test_model_config destroyed its model (model-config-cloudinit-userdata) without switching back, so it fails with "ERROR model lab:admin/model-config-cloudinit-userdata not found" (run 38916474921, 4.0/stable). This is an upstream ordering bug, independent of the lab.
+  - ~~`test_model_constraints`~~ **skipped** (run_model_constraints): runs set-model-constraints on the *current* model. Earlier, test_model_config destroyed its model (model-config-cloudinit-userdata) without switching back, so it fails with "ERROR model lab:admin/model-config-cloudinit-userdata not found" (run 38916474921, 4.0/stable). Upstream ordering bug, independent of the lab: upstream CI runs each cli test function on its own (juju/juju-qa-jenkins c4d82c6, jobs/ci-run/integration/gen/test-cli.yml, skip_tasks = all the others), which hides it.
   - `test_unregister` (run_unregister)
   - `test_block_commands` (run_block_destroy_model, run_block_remove_object, run_block_all)
   - `test_diff_bundle` (run_diff_bundle_reflexive)
 
+- **Upstream quirks (v4.0.15, not lab issues):** `test_local_charms` is an empty function, and `run_model_config_isomorphic` is commented out in `test_model_config`, so neither prints a `] Success:` line. `run_unregister` ends with `exit 0` inside `run`, so it passes without a `] Success:` line too (a failure still exits 1).
 - **Note:** `test_display_clouds` adds cloud `my-ec2` to the lab controller with `--force` (no credentials, nothing gets provisioned). That is harmless, because the controller is bootstrapped per run. `test_unregister` works on a throwaway `JUJU_DATA`, so the lab controller stays registered.
 - **Teardown check:** after a pass, `scripts/no-models-left.sh` requires every non-controller model of every user (`juju models --all`) to be gone within 10 min, else `fail`. Between iterations (`repeat`) `cleanup-models.sh` destroys every user's models by qualified name.
 - **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
 - **Expected verdict:** `pass` on a healthy channel.
 
-- **Budget:** `TIMEOUT_MIN=60` per iteration (calibration: `docs/calibration.md`).
+- **Budget:** `TIMEOUT_MIN=10` per iteration (calibration: `docs/calibration.md`).

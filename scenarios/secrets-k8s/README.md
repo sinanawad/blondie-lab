@@ -18,4 +18,4 @@
 - **No test ran:** `suite.sh` turns a main.sh exit 0 without any `] Success:` line into 3 (`inconclusive`).
 - **Expected verdict:** `pass` on a healthy channel.
 
-- **Budget:** `TIMEOUT_MIN=60` per iteration (calibration: `docs/calibration.md`).
+- **Budget:** `TIMEOUT_MIN=30` per iteration (calibration: `docs/calibration.md`).
