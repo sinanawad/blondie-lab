@@ -63,7 +63,7 @@ if [[ ${LAB_SUBSTRATE:-} == k8s ]]; then
 	fi
 fi
 
-if command -v lxc >/dev/null; then
+if [[ ${LAB_SUBSTRATE:-} == lxd ]] && command -v lxc >/dev/null; then
 	c 60 lxd/list.txt lxc list
 	names=$(timeout 60 lxc list --format=json 2>>"$LOG" | jq -r '.[] | "\(.name) \(.status)"' 2>>"$LOG")
 	while read -r name status; do

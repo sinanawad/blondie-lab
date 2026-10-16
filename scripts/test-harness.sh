@@ -293,14 +293,18 @@ bypass_case 'value on the next line (|)' '    <redacted>' 'admin-secret: |' '   
 bypass_case 'empty value, list on the next line' '  <redacted>' 'statepassword:' '  - deep' 'other: 1'
 bypass_case 'kubeconfig client-key-data' '    client-key-data: <redacted>' '    client-key-data: QUJDREVGRw=='
 bypass_case 'bearer token (k8s credential)' '  token: <redacted>' '  token: eyJhbGciOiJSUzI1NiJ9.abc'
+bypass_case 'non-empty authToken' 'request authToken: <redacted>' 'request authToken: "eyJhbGciOi"'
 bypass_case 'macaroon-<id>= cookie' 'macaroon-abc_12-z=<redacted> Path=/' 'macaroon-abc_12-z=eyJhYmMi; Path=/'
 rm -rf "$tmp/bp" && mkdir -p "$tmp/bp" && printf '%s\n' 'admin-secret: |' '    line one' 'next: 1' >"$tmp/bp/f.txt" && scrub_run bp
 if grep -qx 'next: 1' "$tmp/bp.up/f.txt" && ! grep -q 'line one' "$tmp/bp.up/f.txt"; then pass "scrub: YAML block ends at the next key"; else bad "scrub block end"; cat "$tmp/bp.up/f.txt"; fi
 art="$tmp/clean"
 rm -rf "$art" && mkdir -p "$art"
-printf '%s\n' 'password reset requested' 'juju add-model --password-stdin' 'cert: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t' >"$art/c.txt"
+# Baseline-clean forms seen on real runs: juju's empty authToken and a charm's
+# shell-trace token= (test data).
+printf '%s\n' 'password reset requested' 'juju add-model --password-stdin' 'cert: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t' \
+	'DEBUG juju.apiserver admin.go:248 request authToken: ""' '{"message":"request authToken: \"\""}' '+ token=yeah-boi' >"$art/c.txt"
 scrub_run clean
-if sx clean scrub_hits=0 && sx clean upload_blocked=false; then pass "scrub: no key/value form, base64 certificate -> 0 hits, not blocked"; else bad "scrub clean"; cat "$art.st/scrub.env"; fi
+if sx clean scrub_hits=0 && sx clean upload_blocked=false; then pass "scrub: no key/value form, base64 certificate, empty authToken, token= -> 0 hits, not blocked"; else bad "scrub clean"; cat "$art.st/scrub.env"; fi
 art="$tmp/pk"
 rm -rf "$art" "$tmp/min" && mkdir -p "$art/keys"
 { printf -- '-----BEGIN %s PRIVATE KEY-----\n' OPENSSH; echo zz; } >"$art/keys/k.txt"

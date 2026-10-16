@@ -8,13 +8,19 @@
 # JSON), ':' or '=', then a value: \"..\", "..", '..' or a bare token. Only the
 # value becomes <redacted>. A key with an empty value, '|' or '>' at end of line
 # is a hit too, and the more-indented lines after it are redacted (YAML block).
+# An empty quoted value ("", '', \"\") is left alone and not counted: juju
+# logs `request authToken: ""` on every password login (zero-hit baseline,
+# design §8). `token` (k8s credentials/kubeconfig) only matches with ':', since
+# `token=` is common test data in shell traces (juju-qa-dummy-source hooks).
 use strict;
 use warnings;
 
-my $KEY = qr/(?:password|apipassword|statepassword|oldpassword|admin-secret|macaroons?(?:-[\w-]+)?|client-key-data|token)/i;
+my $KEY = qr/(?:password|apipassword|statepassword|oldpassword|admin-secret|macaroons?(?:-[\w-]+)?|client-key-data)/i;
 my $SEP = qr/\\?["']?[ \t]*[:=][ \t]*/;
+my $KS = qr/(?:${KEY}${SEP}|token\\?["']?[ \t]*:[ \t]*)/i;
+my $EMPTY = qr/^(?:""|''|\\"\\")$/;
 my $VAL = qr/\\"(?:(?!\\").)*\\"|"(?:[^"\\\n]|\\.)*"|'[^'\n]*'|[^\s]+/;
-my $OPEN = qr/${KEY}${SEP}(?:[|>][-+0-9]*)?[ \t]*\r?$/;
+my $OPEN = qr/${KS}(?:[|>][-+0-9]*)?[ \t]*\r?$/;
 # Clear-text PEM, or base64 of "-----BEGIN" that is not a certificate or public key.
 my $PK = qr/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|LS0tLS1CRUdJTi(?!BDRVJUSUZJQ0FURS0tLS0t|BQVUJMSUMgS0VZLS0tLS0)/;
 
@@ -40,7 +46,7 @@ sub redact_stream {
 			print $out $line;
 			next;
 		}
-		$hits += ($line =~ s/(${KEY}${SEP})(?:$VAL)/${1}<redacted>/g);
+		$line =~ s/(${KS})($VAL)/my ($k, $v) = ($1, $2); $v =~ $EMPTY ? "$k$v" : (++$hits, "$k<redacted>")[1]/ge;
 		print $out $line;
 	}
 	return $hits;
