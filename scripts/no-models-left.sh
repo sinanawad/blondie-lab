@@ -14,7 +14,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 deadline=$((SECONDS + limit))
 while :; do
 	left=$(timeout 60 juju models --all -c "${LAB_CONTROLLER:?}" --format=json |
-		jq -r '.models // [] | .[] | select(((."is-controller") | tostring) != "true" and ."short-name" != "controller") | (if (.name // "") | contains("/") then .name else ."short-name" end)') ||
+		jq -r '.models // [] | .[] | select(((."is-controller") | tostring) != "true") | (if (.name // "") | contains("/") then .name else ."short-name" end) | select(. != "admin/controller" and . != "controller")') ||
 		left="(juju models failed)"
 	[[ -z $left ]] && break
 	((SECONDS < deadline)) || { echo "$name: suite passed but its teardown left models after ${limit}s: ${left//$'\n'/ }"; exit 1; }
