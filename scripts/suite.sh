@@ -3,7 +3,10 @@
 # against the lab controller and maps exit codes.
 #   suite.sh [main.sh flags] <suite> [test]   e.g. suite.sh -s test_build smoke
 # - main.sh's exit 1 becomes 2 (setup-error) only if a line of the *setup phase*
-#   (output before the first "===> [   ] Running:") matches an anchored pattern
+#   (output before the first "===> [   ] Running:", or before the second
+#   "====> Reusing bootstrapped juju" line: suites whose tests don't use `run`,
+#   such as sidecar, call `ensure` per test, and a leftover from test N found by
+#   test N+1's ensure is a teardown failure, not infra) matches an anchored pattern
 #   in scripts/infra-signatures.txt. The matched line goes to $LAB_SIGNAL_FILE
 #   for run-scenario.sh to record as infra_signature. After a test started,
 #   exit 1 stays fail.
@@ -50,7 +53,8 @@ done
 if ((rc == 1)); then
 	patterns=$(grep -vE '^[[:space:]]*(#|$)' "$sigs" || true)
 	if [[ -n $patterns ]]; then
-		match=$(awk '/^===> \[   \] Running:/ {exit} {print}' "$out" | grep -E -m1 -f <(printf '%s\n' "$patterns") || true)
+		match=$(awk '/^===> \[   \] Running:/ {exit} /^====> Reusing bootstrapped juju/ && ++reuse == 2 {exit} {print}' "$out" |
+			grep -E -m1 -f <(printf '%s\n' "$patterns") || true)
 		if [[ -n $match ]]; then
 			echo "suite.sh: infra signature in setup phase -> setup-error: $match"
 			[[ -n ${LAB_SIGNAL_FILE:-} ]] && printf '%s\n' "$match" >"$LAB_SIGNAL_FILE"
