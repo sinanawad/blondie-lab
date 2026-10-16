@@ -97,11 +97,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LAB_REF: ${{ steps.validate.outputs.ref }}
           LAB_TESTS_REF: ${{ steps.validate.outputs.tests_ref }}
-          DRILL_API: ${{ startsWith(inputs.request_id, 'drill-api') && '1' || '' }}
-        # DRILL (temporary, PR-5 acceptance): an unreachable API host.
-        run: |
-          if [ "${DRILL_API:-}" = 1 ]; then export GH_HOST=api.invalid; fi
-          exec scripts/ref-trust.sh
+        run: scripts/ref-trust.sh
 
       # Build mode needs the room (design §2 "Disk"); df -h goes to the artifact.
       - name: Free disk (build mode)
@@ -113,6 +109,14 @@ jobs:
         run: |
           mkdir -p "$LAB_ARTIFACT_DIR/collect"
           df -h | tee "$LAB_ARTIFACT_DIR/collect/df-before-free.txt"
+          # A build plus bootstrap uses ~15G (calibration: docs/calibration.md);
+          # hosted runners start with ~86G free, and freeing takes 50-290s.
+          # Only free space when the runner is actually short of it.
+          avail_gb=$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')
+          if [ "${avail_gb:-0}" -ge 30 ]; then
+            echo "root has ${avail_gb}G free (>= 30G): skipping cleanup"
+            exit 0
+          fi
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           docker image prune --all --force >/dev/null || echo "docker image prune failed (continuing)"
           df -h | tee "$LAB_ARTIFACT_DIR/collect/df-after-free.txt"
@@ -219,19 +223,12 @@ jobs:
       # branch-scoped and unreadable from main) and only without an exact hit.
       - name: Save Go module cache (build mode, main only)
         id: gomod_save
-        # DRILL (temporary, PR-5 cache measurement): also from drill-cache runs on the PR branch.
-        if: steps.validate.outputs.source == 'build' && (github.ref == 'refs/heads/main' || startsWith(inputs.request_id, 'drill-cache')) && steps.gomod_restore.outputs.cache-hit != 'true'
+        if: steps.validate.outputs.source == 'build' && github.ref == 'refs/heads/main' && steps.gomod_restore.outputs.cache-hit != 'true'
         timeout-minutes: 5
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/go/pkg/mod
           key: gomod-${{ steps.trust.outputs.ref_line }}-${{ hashFiles('juju-src/go.sum') }}
-
-      # DRILL (temporary, PR-5 acceptance): a juju snap next to the build.
-      - name: "DRILL: install the juju snap in build mode"
-        if: steps.validate.outputs.source == 'build' && startsWith(inputs.request_id, 'drill-snap')
-        timeout-minutes: 5
-        run: sudo snap install juju --channel=4.0/stable
 
       - name: Resolve tests ref
         id: tests
@@ -399,7 +396,8 @@ jobs:
           VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
           READY_OUTCOME: ${{ steps.ready.outcome }}
           SCENARIO_OUTCOME: ${{ steps.scenario.outcome }}
-          BUILD_CACHE_HIT: ${{ steps.gomod_restore.outputs.cache-hit }}
+          # cache-hit is empty on a miss; reported as false when the restore ran.
+          BUILD_CACHE_HIT: ${{ steps.gomod_restore.outcome == 'success' && (steps.gomod_restore.outputs.cache-hit || 'false') || '' }}
           BUILD_CACHE_KEY: ${{ steps.gomod_restore.outputs.cache-matched-key }}
         run: scripts/verdict.sh
 
