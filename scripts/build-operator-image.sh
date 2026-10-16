@@ -25,10 +25,23 @@ start=$SECONDS
 image="ghcr.io/juju/jujud-operator:$version"
 [[ $image =~ ^ghcr\.io/juju/jujud-operator:4\.[0-9]+[A-Za-z0-9.-]*$ ]] || setup_fail "unexpected operator image name '$image'"
 echo "make operator-image OCI_BUILDER=docker (output: collect/build-operator-image.log)"
-if ! make operator-image OCI_BUILDER=docker >"$log" 2>&1; then
+# The Dockerfile's base image comes from public.ecr.aws, which answers 429
+# ("Data limit exceeded") now and then on shared runner IPs (run 38891822632).
+# Retry that one case once; anything else fails at once.
+attempt=1
+until make operator-image OCI_BUILDER=docker >>"$log" 2>&1; do
+	rate_limited=0
+	grep -q '429 Too Many Requests' "$log" && rate_limited=1
+	if [ "$rate_limited" = 1 ] && [ "$attempt" -lt 2 ]; then
+		attempt=$((attempt + 1))
+		echo "base image registry rate-limited (429); retrying make operator-image in ${LAB_OPERATOR_RETRY_S:-60}s" | tee -a "$log"
+		sleep "${LAB_OPERATOR_RETRY_S:-60}"
+		continue
+	fi
 	tail -n 40 "$log" | "$here/redact.pl" || true
+	[ "$rate_limited" = 1 ] && setup_fail "make operator-image failed: base image registry rate-limited (429) after $attempt attempts (see collect/build-operator-image.log)"
 	setup_fail "make operator-image failed (see collect/build-operator-image.log in the artifact)"
-fi
+done
 config=$(docker image inspect --format '{{.Id}}' "$image" 2>>"$log") || setup_fail "the build produced no $image (docker image inspect failed)"
 [[ $config =~ ^sha256:[0-9a-f]{64}$ ]] || setup_fail "operator image config digest '$config' is not a sha256 digest"
 # Fixed strings under sg; the image name travels via env.

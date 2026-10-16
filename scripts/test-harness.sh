@@ -1061,4 +1061,61 @@ rc=0
 env -i PATH="$PATH" LAB_STATE_DIR="$tmp/deps-state" LAB_DEPS=nonexistent bash scripts/deps.sh >"$tmp/log" 2>&1 || rc=$?
 if [[ $rc == 2 ]] && grep -q "unknown dependency 'nonexistent'" "$tmp/deps-state/setup-error.txt"; then pass "deps: unknown dep -> exit 2 with reason"; else bad "deps unknown: rc $rc"; cat "$tmp/log"; fi
 
+# --- build-operator-image.sh: one retry on a registry 429 only -------------------------
+fo="$tmp/fake-opimg"
+mkdir -p "$fo" "$tmp/opsrc"
+cat >"$fo/make" <<'FAKE'
+#!/usr/bin/env bash
+n=$(($(cat "$FAKE_DIR/make.n" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$FAKE_DIR/make.n"
+if ((n <= FAKE_MAKE_FAILS)); then
+	echo "ERROR: failed to solve: $FAKE_MAKE_ERR"
+	exit 1
+fi
+echo "built"
+FAKE
+cat >"$fo/docker" <<'FAKE'
+#!/usr/bin/env bash
+case $1 in
+inspect | image) echo "sha256:$(printf 'c%.0s' {1..64})" ;;
+save) echo image-tar ;;
+esac
+FAKE
+cat >"$fo/sg" <<'FAKE'
+#!/usr/bin/env bash
+cat >/dev/null
+case $3 in
+*"images ls"*) echo "REF TYPE DIGEST"; echo "$LAB_OPERATOR_IMAGE application/x sha256:$(printf 'd%.0s' {1..64})" ;;
+esac
+FAKE
+chmod +x "$fo/make" "$fo/docker" "$fo/sg"
+opimg() { # opimg <name> <fails> <err>
+	o="$tmp/op-$1"
+	rm -rf "$o" && mkdir -p "$o/collect" "$o/state" "$o/fd"
+	orc=0
+	env -i PATH="$fo:$PATH" FAKE_DIR="$o/fd" FAKE_MAKE_FAILS="$2" FAKE_MAKE_ERR="$3" LAB_OPERATOR_RETRY_S=0 LAB_BUILT_VERSION=4.0.15 \
+		LAB_SRC="$tmp/opsrc" LAB_ARTIFACT_DIR="$o" LAB_STATE_DIR="$o/state" bash scripts/build-operator-image.sh >"$o/out" 2>&1 || orc=$?
+}
+opimg r429 1 "429 Too Many Requests"
+if ((orc == 0)) && [[ $(cat "$o/fd/make.n") == 2 ]] && grep -q "^operator_image_target=sha256:d" "$o/state/juju.env"; then
+	pass "operator image: one 429 -> retried once, imported"
+else
+	bad "operator image 429 retry (rc $orc)"
+	cat "$o/out"
+fi
+opimg r429x2 2 "429 Too Many Requests"
+if ((orc == 2)) && [[ $(cat "$o/fd/make.n") == 2 ]] && grep -q "rate-limited (429) after 2 attempts" "$o/state/setup-error.txt"; then
+	pass "operator image: 429 twice -> setup-error naming the rate limit, no third attempt"
+else
+	bad "operator image 429 twice (rc $orc)"
+	cat "$o/out"
+fi
+opimg other 1 "some compile error"
+if ((orc == 2)) && [[ $(cat "$o/fd/make.n") == 1 ]] && grep -qx "make operator-image failed (see collect/build-operator-image.log in the artifact)" "$o/state/setup-error.txt"; then
+	pass "operator image: other make failure -> setup-error, no retry"
+else
+	bad "operator image other failure (rc $orc)"
+	cat "$o/out"
+fi
+
 exit "$status"
