@@ -19,7 +19,7 @@ on:
         type: string
         default: "4.0/stable"
       ref:
-        description: "Optional juju/juju tag or SHA; switches to build mode"
+        description: "Optional sinanawad/juju SHA or release branch (4.1, 4.0); switches to build mode"
         required: false
         type: string
         default: ""

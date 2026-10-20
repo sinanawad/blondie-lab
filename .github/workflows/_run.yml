@@ -12,10 +12,10 @@
 # job result. On k8s, every step that talks to MicroK8s or the controller runs
 # under `sg snap_microk8s -c <fixed string>` (design §4; the group is added
 # mid-job, so only a new group session sees it).
-# Build mode (ref set; design §3): juju/juju at the trusted ref_sha is built
-# with `make go-install` (and on k8s the operator image is imported into
-# MicroK8s); $(go env GOPATH)/bin is first on PATH and no juju snap is
-# installed; bootstrap.sh asserts the binary and the agent identity.
+# Build mode (ref set; design §3): sinanawad/juju (Sinan's fork) at the trusted
+# ref_sha is built with `make go-install` (and on k8s the operator image is
+# imported into MicroK8s); $(go env GOPATH)/bin is first on PATH and no juju
+# snap is installed; bootstrap.sh asserts the binary and the agent identity.
 name: _run
 
 on:
@@ -88,8 +88,9 @@ jobs:
           LAB_IN_REQUEST_ID: ${{ inputs.request_id }}
         run: scripts/validate.sh
 
-      # Design §8 (Q8): resolve ref/tests_ref to SHAs and check them against
-      # juju/juju before any setup; fails closed on any API error.
+      # Design §8 (Q8): resolve ref/tests_ref to SHAs and check ref against
+      # protected sinanawad/juju release branches, tests_ref against juju/juju,
+      # before any setup; fails closed on any API error.
       - name: Ref trust check
         id: trust
         if: steps.validate.outputs.trust == '1'
@@ -183,13 +184,13 @@ jobs:
         run: scripts/setup-juju.sh
 
       # --- Build mode (design §3). Only reached after the trust check passed. ---
-      - name: Checkout juju/juju at ref_sha (build mode)
+      - name: Checkout sinanawad/juju at ref_sha (build mode)
         id: src_checkout
         if: steps.validate.outputs.source == 'build' && steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''
         timeout-minutes: 5
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: juju/juju
+          repository: sinanawad/juju
           ref: ${{ steps.trust.outputs.ref_sha }}
           path: juju-src
           # .git is kept (GIT_COMMIT for the build and for --build-agent).
