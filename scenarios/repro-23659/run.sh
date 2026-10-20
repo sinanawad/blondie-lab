@@ -69,11 +69,11 @@ left() {
 }
 
 status_json() {
-	timeout 60 juju status -m "$Q" --format json
+	timeout -k 5 60 juju status -m "$Q" --format json
 }
 
 lxc_names() {
-	timeout 30 lxc list --project default --format json | jq -r '.[].name'
+	timeout -k 5 30 lxc list --project default --format json | jq -r '.[].name'
 }
 
 has_machine() {
@@ -91,8 +91,11 @@ has_ct() {
 
 # Plan check is `dlog | grep -F … | grep -qF …`. pipefail is off in that
 # subshell so grep -q closing the pipe cannot turn a real match into SIGPIPE.
+# Stdout only: juju's stderr must not enter debug-log.txt or those greps.
+# No `|| true`: a failed debug-log keeps `dlog >file || log "… failed"` live.
 dlog() {
-	timeout 60 juju debug-log -m "$Q" --replay --no-tail 2>&1 | head -c 20M || true
+	set -o pipefail
+	timeout -k 5 60 juju debug-log -m "$Q" --replay --no-tail | head -c 20M
 }
 
 gate_seen() {
@@ -186,11 +189,11 @@ unprotect() {
 	IN_UNPROTECT=1
 	if [[ $PROTECTED == 1 && -n $C0 ]]; then
 		log "cleanup: unset protection on $C0"
-		timeout 30 lxc config unset "$C0" security.protection.delete --project default ||
+		timeout -k 5 30 lxc config unset "$C0" security.protection.delete --project default ||
 			log "cleanup: unset $C0 failed"
 		PROTECTED=0
 	fi
-	json=$(timeout 30 lxc list --project default --format json 2>/dev/null) || json=
+	json=$(timeout -k 5 30 lxc list --project default --format json 2>/dev/null) || json=
 	if [[ -z $json ]]; then
 		log "cleanup: lxc list for protection backstop failed"
 	else
@@ -198,7 +201,7 @@ unprotect() {
 		while IFS= read -r name; do
 			[[ -n $name ]] || continue
 			log "cleanup: backstop unset protection on $name"
-			timeout 30 lxc config unset "$name" security.protection.delete --project default ||
+			timeout -k 5 30 lxc config unset "$name" security.protection.delete --project default ||
 				log "cleanup: unset $name failed"
 		done <<<"$names"
 	fi
@@ -209,15 +212,16 @@ unprotect() {
 
 model_absent() {
 	local st present
-	st=$(timeout 60 juju models -c "$CTRL" --format json) || return 1
+	st=$(timeout -k 5 60 juju models -c "$CTRL" --format json) || return 1
 	present=$(jq -r --arg m "$M" --arg am "admin/$M" \
 		'[.models[]? | select(."short-name" == $m or .name == $m or .name == $am)] | length' <<<"$st") || return 1
 	[[ $present == 0 ]]
 }
 
 cleanup() {
-	local start elapsed
+	# First: `local` would clobber $? and an unexpected exit would record 0.
 	trap_rc=$?
+	local start elapsed
 	if [[ $CLEANED == 1 ]]; then
 		return 0
 	fi
@@ -230,11 +234,11 @@ cleanup() {
 	grep -E 'stopping known instances|failed to remove containers|shutting down pool|exiting provisioner task loop|removing dead machine' \
 		"$OUT/debug-log.txt" >"$OUT/provisioner-lines.txt" || true
 	status_json >"$OUT/status-final.json" || log "cleanup: final status failed"
-	timeout 30 lxc list --project default --format json >"$OUT/lxc-final.json" ||
+	timeout -k 5 30 lxc list --project default --format json >"$OUT/lxc-final.json" ||
 		log "cleanup: final lxc list failed"
 	# (c) destroy. Failures are logged and do not change RC.
 	log "cleanup: destroy-model $Q"
-	timeout 120 juju destroy-model --no-prompt --destroy-storage --force --no-wait "$Q" ||
+	timeout -k 5 120 juju destroy-model --no-prompt --destroy-storage --force --no-wait "$Q" ||
 		log "cleanup: destroy-model returned non-zero"
 	start=$SECONDS
 	while :; do
@@ -249,14 +253,20 @@ cleanup() {
 		fi
 		sleep 10
 	done
-	if [[ $FINISHING == 0 && ! -f $OUT/result.json ]]; then
-		if [[ $REASON == "unexpected exit" ]]; then
-			RC=$trap_rc
+	# A raw status of 1 is the harness's "reproduced". Map an unexpected death
+	# to setup-error or inconclusive instead, and make that the process status.
+	if [[ $FINISHING == 0 && $REASON == "unexpected exit" ]]; then
+		if [[ $PHASE == setup ]]; then
+			RC=2
+		else
+			RC=3
 		fi
 		if [[ -z $T_DECIDED ]]; then
 			T_DECIDED=$((SECONDS - T0))
 		fi
+		log "cleanup: unexpected exit status $trap_rc -> $RC"
 		write_result || log "cleanup: result.json failed"
+		exit "$RC"
 	fi
 	return 0
 }
@@ -264,6 +274,9 @@ cleanup() {
 finish() {
 	local rc=$1 result=$2 reason=$3
 	if [[ $FINISHING == 1 ]]; then
+		# A signal during unprotect leaves IN_UNPROTECT=1, which would skip the
+		# backstop sweep. Clear it so this call still removes protection.
+		IN_UNPROTECT=0
 		unprotect || true
 		write_result || true
 		exit "$RC"
@@ -279,6 +292,8 @@ finish() {
 	fi
 	FINISHING=1
 	log "finish: rc=$RC result=$RESULT phase=$PHASE reason=$REASON"
+	# Write before cleanup so a crash during teardown still leaves the decision.
+	write_result || log "finish: result.json before cleanup failed"
 	cleanup
 	write_result || log "finish: result.json failed"
 	exit "$RC"
@@ -289,7 +304,7 @@ release() {
 	local hm0 hm1 hc0 hc1
 	log "release: unset protection on ${C0:-}"
 	if [[ -n $C0 ]]; then
-		timeout 30 lxc config unset "$C0" security.protection.delete --project default ||
+		timeout -k 5 30 lxc config unset "$C0" security.protection.delete --project default ||
 			log "release: unset failed"
 	fi
 	PROTECTED=0
@@ -568,7 +583,7 @@ main() {
 	local got i
 	log "start model=$M timeout_min=$LAB_TIMEOUT_MIN left=$(left)s"
 	log "add-model $M"
-	if ! timeout 90 juju add-model "$M" localhost --controller "$CTRL" --no-switch \
+	if ! timeout -k 5 90 juju add-model "$M" localhost --controller "$CTRL" --no-switch \
 		--config project=default \
 		--config enable-os-upgrade=false \
 		--config enable-os-refresh-update=false; then
@@ -576,7 +591,7 @@ main() {
 	fi
 	for i in 1 2; do
 		log "add-machine $i"
-		if ! timeout 90 juju add-machine -m "$Q" --base ubuntu@24.04; then
+		if ! timeout -k 5 90 juju add-machine -m "$Q" --base ubuntu@24.04; then
 			finish 2 error "add-machine failed"
 		fi
 	done
@@ -586,25 +601,25 @@ main() {
 	fi
 	log "machines ready c0=$C0 c1=$C1"
 	log "protect $C0"
-	if ! timeout 30 lxc config set "$C0" security.protection.delete=true --project default; then
+	if ! timeout -k 5 30 lxc config set "$C0" security.protection.delete=true --project default; then
 		finish 2 error "lxc config set protection failed"
 	fi
 	PROTECTED=1
-	got=$(timeout 30 lxc config get "$C0" security.protection.delete --project default 2>/dev/null) || true
+	got=$(timeout -k 5 30 lxc config get "$C0" security.protection.delete --project default 2>/dev/null) || true
 	got=${got//$'\r'/}
 	got=${got//$'\n'/}
 	if [[ $got != true ]]; then
 		finish 2 error "protection not confirmed"
 	fi
 	status_json >"$OUT/status-before.json" || finish 2 error "status snapshot failed"
-	timeout 30 lxc list --project default --format json >"$OUT/lxc-before.json" ||
+	timeout -k 5 30 lxc list --project default --format json >"$OUT/lxc-before.json" ||
 		finish 2 error "lxc snapshot failed"
 	if (($(left) <= 0)); then
 		finish 2 error "budget exhausted before repro"
 	fi
 	PHASE=repro
 	log "remove-machine 0"
-	if ! timeout 90 juju remove-machine -m "$Q" --no-prompt 0; then
+	if ! timeout -k 5 90 juju remove-machine -m "$Q" --no-prompt 0; then
 		conclude 3 error "remove-machine 0 failed"
 	fi
 	T_REMOVE0=$((SECONDS - T0))
@@ -617,7 +632,7 @@ main() {
 		conclude 3 error "precondition not reached"
 	fi
 	log "remove-machine 1"
-	if ! timeout 90 juju remove-machine -m "$Q" --no-prompt 1; then
+	if ! timeout -k 5 90 juju remove-machine -m "$Q" --no-prompt 1; then
 		conclude 3 error "remove-machine 1 failed"
 	fi
 	T_REMOVE1=$((SECONDS - T0))
