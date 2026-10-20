@@ -28,12 +28,12 @@ Snapshot, read-only, 2026-10-20: `main` behind 184; `4.0` behind 69; `3.6` behin
 ## 2. Pick a bug
 - Find 2–3 open, recently reported juju **4.x** bugs that have clear repro steps on **LXD** or **MicroK8s**.
 - For each one, give Sinan the link, the reported version and the substrate. Sinan picks.
-- Bug tracker: GitHub issues on `juju/juju` and/or Launchpad. **TBD**: which one is canonical for 4.x.
+- Bug tracker: GitHub issues on `juju/juju` only. Launchpad is legacy; don't use it.
 
 ## 3. Plan (not committed)
 - The plan always runs on Opus 5.5. It produces a short brief for the cheaper implementer: the issue, the steps, the pinned versions and the expected verdict.
 - The brief goes in the PR description. It is not committed.
-- Model choices come from the crew charter (`TEAM.yaml` in `sinanawad/bot-crew`; **TBD** exact path). Don't hard-code them here.
+- Model choices come from the crew charter, `sinanawad/bot-crew` `charter/TEAM.yaml` on `main`. Joro maintains the charter. Re-read it each time; don't hard-code models here.
 
 ## 4. Scenario PR on blondie-lab
 Add `scenarios/repro-<issue>/`, following the existing layout (see `scenarios/smoke/`: `run.sh`, `scenario.env`, `README.md`):
