@@ -781,7 +781,7 @@ if grep -q $'\tMISSING$' <<<"$steps_tm"; then
 fi
 # path_sum <excluded step names, |-separated>: sum over the other steps.
 path_sum() { awk -F'\t' -v ex="$1" 'BEGIN { split(ex, e, "|"); for (i in e) x[e[i]] = 1 } !($1 in x) { s += $2 } END { print s }' <<<"$steps_tm"; }
-bm='Free disk (build mode)|Checkout juju/juju at ref_sha (build mode)|Set up Go (build mode)|Build juju (build mode)|Bootstrap (LXD build mode)'
+bm='Free disk (build mode)|Checkout sinanawad/juju at ref_sha (build mode)|Set up Go (build mode)|Build juju (build mode)|Bootstrap (LXD build mode)'
 declare -A paths=(
 	[lxd-build]='Set up MicroK8s|Install juju snap|Bootstrap'
 	[k8s-build]='Set up LXD|Wait for LXD|Install juju snap|Bootstrap (LXD build mode)'
@@ -805,12 +805,24 @@ fi
 # source == build and the implicit success().
 guard="steps.trust.outcome == 'success' && steps.trust.outputs.ref_sha != ''"
 nguard=0
-for name in 'Free disk (build mode)' 'Checkout juju/juju at ref_sha (build mode)' 'Set up Go (build mode)' \
+for name in 'Free disk (build mode)' 'Checkout sinanawad/juju at ref_sha (build mode)' 'Set up Go (build mode)' \
 	'Build juju (build mode)'; do
 	cond=$(awk -v n="      - name: $name" '$0 == n {f = 1; next} f && /^      - name: / {exit} f && /^        if: / {print; exit}' "$wf")
 	if [[ $cond == *"$guard"* ]]; then nguard=$((nguard + 1)); else bad "trust gate: '$name' if: lacks the trust guard ($cond)"; fi
 done
 ((nguard == 4)) && pass "trust gate: all 4 build-mode steps require the trust step's success and ref_sha"
+# The build-mode checkout repository is the fork, and it equals ref-trust.sh's
+# ref_repo constant. The tests checkout stays on juju/juju.
+src_repo=$(awk -v n="      - name: Checkout sinanawad/juju at ref_sha (build mode)" \
+	'$0 == n {f = 1; next} f && /^      - name: / {exit} f && /^          repository: / {print $2; exit}' "$wf")
+tests_repo=$(awk -v n="      - name: Checkout juju/juju tests" \
+	'$0 == n {f = 1; next} f && /^      - name: / {exit} f && /^          repository: / {print $2; exit}' "$wf")
+trust_repo=$(sed -n 's/^ref_repo=//p' scripts/ref-trust.sh | head -n 1)
+if [[ $src_repo == sinanawad/juju && $src_repo == "$trust_repo" && $tests_repo == juju/juju ]]; then
+	pass "build checkout: repository $src_repo matches ref_repo; tests checkout stays juju/juju"
+else
+	bad "build checkout: repository '$src_repo', ref_repo '$trust_repo', tests '$tests_repo'"
+fi
 
 # no-models-left.sh on k8s: a labelled model namespace left behind is a fail.
 nml() { # nml <name> [VAR=value...]
@@ -862,20 +874,31 @@ brc=0
 env -i PATH="$fb:$PATH" LAB_CONTROLLER=lab LAB_CLOUD=aws LAB_JUJU_SOURCE=snap LAB_ARTIFACT_DIR="$b" LAB_STATE_DIR="$b.state" bash scripts/bootstrap.sh >"$b.out" 2>&1 || brc=$?
 if ((brc == 2)) && grep -q 'LAB_CLOUD: unexpected value' "$b.state/setup-error.txt"; then pass "bootstrap: LAB_CLOUD outside localhost|microk8s -> setup-error"; else bad "bootstrap bad cloud"; fi
 
-# --- ref-trust.sh (design §8): resolve, reachability, version file, flavour gate ---
-# Fake gh: A = v4.0.15 (4.0 tree), M = main (4.2, controller snap), F = fork-only,
-# T = v3.6.29 (3.6 only), O = pre-June 3.6 SHA (reachable from 4.0, 3.6 version file).
+# --- ref-trust.sh (design §8): resolve, reachability, protection, version file, flavour gate ---
+# Fake gh: A = v4.0.15 (4.0 tree, ahead of fork 4.0), M = main (behind 4.1/4.0),
+# F = diverged, T = v3.6.29 (3.6 only), O = pre-June 3.6 SHA (ahead of every
+# branch, 3.6 version file). L = e41 (identical to fork 4.1, version 4.1-beta3,
+# clean Makefile). N = snapflav (identical to fork 4.1, 4.x version.go so the
+# flavour gate reaches a Makefile with jujud-snap-build).
 A=$(printf 'a%.0s' {1..40}) M=$(printf 'b%.0s' {1..40}) F=$(printf 'c%.0s' {1..40})
 T=$(printf 'd%.0s' {1..40}) O=$(printf 'e%.0s' {1..40})
+L=$(printf 'f%.0s' {1..40}) N=$(printf '9%.0s' {1..40})
 fg2="$tmp/fake-gh-trust"
 mkdir -p "$fg2"
 cat >"$fg2/gh" <<FAKE
 #!/usr/bin/env bash
 A=$A M=$M F=$F T=$T O=$O
+L=$L N=$N
 FAKE
 cat >>"$fg2/gh" <<'FAKE'
 p=""
-for a in "$@"; do [[ $a == repos/* ]] && p=$a; done
+jq_prog=""
+prev=""
+for a in "$@"; do
+	[[ $a == repos/* ]] && p=$a
+	[[ $prev == --jq ]] && jq_prog=$a
+	prev=$a
+done
 echo "$p" >>"$FAKE_LOG"
 nf() { echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
 [[ -n ${FAKE_SLEEP:-} ]] && sleep "$FAKE_SLEEP"
@@ -887,22 +910,48 @@ case $p in
 */commits/fork) echo "$F" ;;
 */commits/v3.6.29) echo "$T" ;;
 */commits/old36) echo "$O" ;;
+*/commits/e41) echo "$L" ;;
+*/commits/snapflav) echo "$N" ;;
 */commits/garbage) echo "<html>" ;;
 */commits/*) echo "gh: No commit found for SHA: x (HTTP 422)" >&2; exit 1 ;;
 */compare/*)
 	s=${p#*/compare/}; s=${s%%...*}; b=${p#*...}; b=${b%%\?*}
 	case "$s $b" in
-	"$A main" | "$O "*) echo ahead ;;
+	"$A 4.0" | "$O "*) echo ahead ;;
+	"$L 4.1" | "$N 4.1") echo identical ;;
 	"$M main") echo identical ;;
 	"$T 3.6") echo ahead ;;
 	"$A "* | "$M "*) echo behind ;;
 	*) echo diverged ;;
 	esac ;;
+*/rules/branches/*)
+	rb=${p##*/}
+	if [[ -n ${FAKE_RULES_404:-} ]]; then nf; fi
+	body='[{"type":"deletion"},{"type":"non_fast_forward"}]'
+	if [[ ${FAKE_RULES:-} == deletion ]]; then
+		body='[{"type":"deletion"}]'
+	fi
+	if [[ -n ${FAKE_UNPROTECTED:-} ]]; then
+		for u in $FAKE_UNPROTECTED; do
+			[[ $rb == "$u" ]] && body='[]'
+		done
+	fi
+	# gh api --jq reduces the rules payload to true/false.
+	if [[ -n $jq_prog ]]; then
+		printf '%s\n' "$body" | jq -r "$jq_prog"
+	else
+		printf '%s\n' "$body"
+	fi
+	;;
 */contents/core/version/version.go\?ref=$A) echo 'const version = "4.0.15"' ;;
 */contents/core/version/version.go\?ref=$M) echo 'const version = "4.2-beta1"' ;;
+*/contents/core/version/version.go\?ref=$L) echo 'const version = "4.1-beta3"' ;;
+*/contents/core/version/version.go\?ref=$N) echo 'const version = "4.1-beta3"' ;;
 */contents/version/version.go\?ref=$O) echo 'const version = "3.6.26"' ;;
 */contents/Makefile\?ref=$A) printf 'go-install: $(INSTALL_TARGETS)\n' ;;
+*/contents/Makefile\?ref=$L) printf 'go-install: $(INSTALL_TARGETS)\n' ;;
 */contents/Makefile\?ref=$M) printf 'jujud-snap-build:\n' ;;
+*/contents/Makefile\?ref=$N) printf 'jujud-snap-build:\n' ;;
 *) nf ;;
 esac
 FAKE
@@ -931,13 +980,13 @@ else
 	bad "ref-trust tag outputs"
 	cat "$tmp/tr-tag/out"
 fi
-trust main 2 "controller-snap builds not supported in v1" LAB_REF=main
-trust fork 2 "not reachable from juju/juju main, 4.1 or 4.0 (fork-only or unknown commit), not trusted" LAB_REF=fork
+trust main 2 "not reachable from a protected sinanawad/juju release branch (4.1, 4.0)" LAB_REF=main
+trust fork 2 "not reachable from a protected sinanawad/juju release branch (4.1, 4.0)" LAB_REF=fork
 trust v36tag 2 "3.6 ref builds not supported (reachable only from 3.6" LAB_REF=v3.6.29
 trust old36 2 "3.6 ref builds not supported (version/version.go says 3.6.26)" LAB_REF=old36
-trust unknown 2 "ref 'nope': no such commit, tag or branch in juju/juju" LAB_REF=nope
+trust unknown 2 "ref 'nope': no such commit, tag or branch in sinanawad/juju" LAB_REF=nope
 trust api-resolve 2 "trust check could not complete (resolve ref: gh: Server Error (HTTP 502))" LAB_REF=v4.0.15 FAKE_FAIL=commits/
-trust api-compare 2 "trust check could not complete (compare with main" LAB_REF=v4.0.15 FAKE_FAIL=compare/
+trust api-compare 2 "trust check could not complete (compare with 4.1" LAB_REF=v4.0.15 FAKE_FAIL=compare/
 trust api-version 2 "trust check could not complete (read core/version/version.go" LAB_REF=v4.0.15 FAKE_FAIL=version.go
 trust api-makefile 2 "trust check could not complete (read Makefile" LAB_REF=v4.0.15 FAKE_FAIL=Makefile
 trust malformed 2 "trust check could not complete (resolve ref: malformed response)" LAB_REF=garbage
@@ -950,13 +999,57 @@ if ! grep -q 'version.go' "$tmp/tr-fork.gh"; then pass "ref-trust: fork SHA reje
 # Only 404/422 mean "absent": a 403 rate limit or a 429 is "could not complete".
 trust api-403 2 "trust check could not complete (resolve ref: gh: API rate limit exceeded for installation ID 1. (HTTP 403))" \
 	LAB_REF=v4.0.15 FAKE_FAIL=commits/ "FAKE_FAIL_MSG=gh: API rate limit exceeded for installation ID 1. (HTTP 403)"
-trust api-429 2 "trust check could not complete (compare with main: gh: Too Many Requests (HTTP 429))" \
+trust api-429 2 "trust check could not complete (compare with 4.1: gh: Too Many Requests (HTTP 429))" \
 	LAB_REF=v4.0.15 FAKE_FAIL=compare/ "FAKE_FAIL_MSG=gh: Too Many Requests (HTTP 429)"
 # compare 404 on every branch (no common history anywhere) is a rejection, never trust.
-trust compare-404 2 "not reachable from juju/juju main, 4.1 or 4.0 (fork-only or unknown commit), not trusted" LAB_REF=v4.0.15 FAKE_COMPARE_404=1
+trust compare-404 2 "not reachable from a protected sinanawad/juju release branch (4.1, 4.0)" LAB_REF=v4.0.15 FAKE_COMPARE_404=1
+trust fork41 0 "ref_sha=$L" LAB_REF=e41
+if grep -qx 'ref_line=4.1' "$tmp/tr-fork41/out" && grep -qx 'ref_repo=sinanawad/juju' "$tmp/tr-fork41/out" && grep -qx 'ref_repo=sinanawad/juju' "$tmp/tr-fork41/juju.env"; then
+	pass "ref-trust: fork41 outputs ref_sha, ref_line and ref_repo"
+else
+	bad "ref-trust fork41 outputs"
+	cat "$tmp/tr-fork41/out" "$tmp/tr-fork41/juju.env"
+fi
+trust unprotected 2 "; unprotected: 4.1, 4.0" LAB_REF=e41 FAKE_UNPROTECTED="4.1 4.0"
+if ! grep -qF "compare/$L...4.1" "$tmp/tr-unprotected.gh" && ! grep -qF "compare/$L...4.0" "$tmp/tr-unprotected.gh"; then
+	pass "ref-trust: unprotected anchors are not compared"
+else
+	bad "ref-trust unprotected compared an anchor"
+	cat "$tmp/tr-unprotected.gh"
+fi
+trust partial-rules 2 "; unprotected: 4.1, 4.0" LAB_REF=e41 FAKE_RULES=deletion
+trust rules-404 2 "; unprotected: 4.1, 4.0" LAB_REF=e41 FAKE_RULES_404=1
+trust api-rules 2 "trust check could not complete (rules for 4.1" LAB_REF=e41 FAKE_FAIL=rules/
+trust one-unprotected 2 "not reachable from a protected sinanawad/juju release branch (4.1, 4.0); unprotected: 4.1" LAB_REF=e41 FAKE_UNPROTECTED=4.1
+if grep -qx "ref 'e41' ($L): not reachable from a protected sinanawad/juju release branch (4.1, 4.0); unprotected: 4.1" "$tmp/tr-one-unprotected/setup-error.txt" &&
+	grep -qF "compare/$L...4.0" "$tmp/tr-one-unprotected.gh" &&
+	! grep -qF "compare/$L...4.1" "$tmp/tr-one-unprotected.gh"; then
+	pass "ref-trust: one unprotected anchor skips only that compare"
+else
+	bad "ref-trust one-unprotected compare set"
+	cat "$tmp/tr-one-unprotected/setup-error.txt" "$tmp/tr-one-unprotected.gh"
+fi
+trust snapflav 2 "controller-snap builds not supported" LAB_REF=snapflav
 # ref + tests_ref in one run: two resolves, $via reused.
 trust both 0 "tests_ref_sha=$T" LAB_REF=v4.0.15 LAB_TESTS_REF=v3.6.29
 if grep -qx "ref_sha=$A" "$tmp/tr-both/out" && grep -qx 'ref_line=4.0' "$tmp/tr-both/out"; then pass "ref-trust: ref + tests_ref -> both SHAs, ref_line from ref"; else bad "ref-trust both outputs"; cat "$tmp/tr-both/out"; fi
+# Repo split: every ref call is sinanawad/juju; every tests_ref call is juju/juju.
+split_ok=1
+while IFS= read -r line; do
+	[[ -n $line ]] || continue
+	if [[ $line == *"/commits/v3.6.29" || $line == *"/compare/${T}..."* ]]; then
+		[[ $line == repos/juju/juju/* ]] || split_ok=0
+	else
+		[[ $line == repos/sinanawad/juju/* ]] || split_ok=0
+	fi
+done <"$tmp/tr-both.gh"
+if ((split_ok)) && grep -q '^repos/sinanawad/juju/' "$tmp/tr-both.gh" && grep -q '^repos/juju/juju/' "$tmp/tr-both.gh" &&
+	! grep -q 'repos/juju/juju' "$tmp/tr-fork41.gh"; then
+	pass "ref-trust: ref calls use sinanawad/juju, tests_ref calls use juju/juju"
+else
+	bad "ref-trust repo split"
+	cat "$tmp/tr-both.gh" "$tmp/tr-fork41.gh"
+fi
 # A slow API ends with the script's own reason inside the step timeout.
 trust deadline 2 "trust check could not complete (resolve ref: timed out after 1s)" LAB_REF=v4.0.15 LAB_TRUST_DEADLINE_S=1 FAKE_SLEEP=3
 trc=0
@@ -1150,7 +1243,7 @@ fi
 # --- verdict.sh: build-mode fields --------------------------------------------------
 art="$tmp/art-build"
 pipeline "$art" scenarios selftest 1
-printf '%s\n' "juju_version=4.0.14" "juju_git_commit=$A" source=build "ref_sha=$A" ref_version=4.0.14 build_go_install_s=600 build_s=700 gomodcache_mb=1500 gomod_download_s=55 \
+printf '%s\n' "juju_version=4.0.14" "juju_git_commit=$A" source=build "ref_sha=$A" ref_repo=sinanawad/juju ref_version=4.0.14 build_go_install_s=600 build_s=700 gomodcache_mb=1500 gomod_download_s=55 \
 	build_operator_image_s=100 "operator_image=ghcr.io/juju/jujud-operator:4.0.14" "operator_image_config=$cfg" "operator_image_target=$tgt" \
 	"operator_image_base=public.ecr.aws/ubuntu/ubuntu:24.04@sha256:$(printf 'b%.0s' {1..64})" \
 	controller_agent_version=4.0.14.1 agent_source=local >"$art.state/juju.env"
@@ -1159,7 +1252,7 @@ echo ref=v4.0.14 >>"$art.state/valid.env"
 env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBSTRATE=lxd \
 	VALIDATE_OUTCOME=success READY_OUTCOME=success SCENARIO_OUTCOME=success bash scripts/verdict.sh >"$tmp/log" 2>&1
 check "verdict: build mode -> source build, ref_sha, juju_channel null, build{timings, operator_image incl. base}, no cache fields" "$art" \
-	".source == \"build\" and .ref_sha == \"$A\" and .ref == \"v4.0.14\" and .juju_channel == null and .juju_snap_revision == null and .build.build_s == 700 and .build.go_install_s == 600 and .build.gomod_download_s == 55 and .build.gomodcache_mb == 1500 and (.build | has(\"gomod_cache\") | not) and .build.operator_image.config_digest == \"$cfg\" and (.build.operator_image.base | endswith(\"@sha256:$(printf 'b%.0s' {1..64})\")) and .controller_agent_version == \"4.0.14.1\""
+	".source == \"build\" and .ref_sha == \"$A\" and .ref_repo == \"sinanawad/juju\" and .ref == \"v4.0.14\" and .juju_channel == null and .juju_snap_revision == null and .build.build_s == 700 and .build.go_install_s == 600 and .build.gomod_download_s == 55 and .build.gomodcache_mb == 1500 and (.build | has(\"gomod_cache\") | not) and .build.operator_image.config_digest == \"$cfg\" and (.build.operator_image.base | endswith(\"@sha256:$(printf 'b%.0s' {1..64})\")) and .controller_agent_version == \"4.0.14.1\""
 art="$tmp/art-buildmin"
 pipeline "$art" scenarios selftest 1
 printf '%s\n' source=build >"$art.state/juju.env"
@@ -1168,7 +1261,7 @@ env -i PATH="$PATH" LAB_STATE_DIR="$art.state" LAB_ARTIFACT_DIR="$art" LAB_SUBST
 check "verdict: build mode with no timings recorded -> null fields, operator_image null" "$art" '.build.build_s == null and .build.gomod_download_s == null and .build.operator_image == null'
 art="$tmp/art-snapsrc"
 pipeline "$art" scenarios selftest 1
-check "verdict: snap/none runs have build null and ref_sha null" "$art" '.build == null and .ref_sha == null'
+check "verdict: snap/none runs have build null and ref_sha null" "$art" '.build == null and .ref_sha == null and .ref_repo == null'
 
 # --- verdict.sh: juju + scrub state -> verdict.json, job outputs ----------------------
 art="$tmp/art-jujustate"

@@ -121,8 +121,8 @@ if [[ $NEEDS_JUJU == 0 ]]; then
 	[[ $NEEDS_TESTS == 0 && -z $DEPS ]] || fail "scenario.env: NEEDS_JUJU=0 excludes NEEDS_TESTS=1 and DEPS"
 else
 	[[ $NEEDS_TESTS == 1 || -z $tests_ref ]] || fail "tests_ref: not used by scenario $scenario (NEEDS_TESTS=0)"
-	# ref (build mode) and an explicit tests_ref are checked against juju/juju
-	# by scripts/ref-trust.sh in the next step, before any setup (design §8).
+	# ref against protected sinanawad/juju release branches, tests_ref against
+	# juju/juju, by scripts/ref-trust.sh before any setup (design §8).
 	# DEPS words must be in the vocabulary deps.sh installs from (fail in seconds,
 	# not after the LXD and juju setup).
 	for d in $DEPS; do

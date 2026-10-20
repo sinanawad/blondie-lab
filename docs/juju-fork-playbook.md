@@ -51,7 +51,7 @@ The cloud agent never runs juju itself. It dispatches a lab workflow on a GitHub
 - `.github/workflows/lab-lxd.yml` for machine charms on LXD.
 - `.github/workflows/lab-microk8s.yml` for K8s.
 - Both call the harness `.github/workflows/_run.yml`.
-- Inputs: `scenario`, `juju_channel` (snap mode, e.g. `4.0/stable`) or `ref` (a juju tag or SHA; switches to build mode), `repeat` (1–10), and a unique `request_id`.
+- Inputs: `scenario`, `juju_channel` (snap mode, e.g. `4.0/stable`) or `ref` (a sinanawad/juju SHA or release branch (build mode; the branch must be synced and protected)), `repeat` (1–10), and a unique `request_id`.
 
 What the runner does:
 1. Installs the reported juju version.

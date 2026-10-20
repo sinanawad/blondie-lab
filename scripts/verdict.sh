@@ -145,7 +145,7 @@ jq -n \
 	--arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}" \
 	--arg juju_version "$(s_ juju_version)" --arg juju_git_commit "$(s_ juju_git_commit)" \
 	--arg juju_snap_revision "$(s_ juju_snap_revision)" --arg source "$src_" \
-	--arg ref_sha "$(s_ ref_sha)" --argjson build "$build_json" \
+	--arg ref_sha "$(s_ ref_sha)" --arg ref_repo "$(s_ ref_repo)" --argjson build "$build_json" \
 	--arg tests_sha "$(s_ tests_sha)" --arg tests_source "$(s_ tests_source)" \
 	--arg sub_name "$(s_ substrate_snap_name)" --arg sub_channel "$(s_ substrate_snap_channel)" \
 	--arg sub_rev "$(s_ substrate_snap_revision)" \
@@ -169,7 +169,7 @@ jq -n \
 		controller_images: $images,
 		bootstrap_args: v($bootstrap_args),
 		source: (if $no_juju then "none" else v($source) end),
-		ref: v($ref), ref_sha: v($ref_sha), build: $build,
+		ref: v($ref), ref_repo: v($ref_repo), ref_sha: v($ref_sha), build: $build,
 		tests_ref: v($tests_ref), tests_sha: v($tests_sha), tests_source: v($tests_source),
 		lab_sha: $lab_sha, runner_image: $runner_image,
 		deps: $deps,
