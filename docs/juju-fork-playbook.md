@@ -31,7 +31,7 @@ Snapshot, read-only, 2026-10-20: `main` behind 184; `4.0` behind 69; `3.6` behin
 - Bug tracker: GitHub issues on `juju/juju` only. Launchpad is legacy; don't use it.
 
 ## 3. Plan (not committed)
-- The plan always runs on Opus 5.5. It produces a short brief for the cheaper implementer: the issue, the steps, the pinned versions and the expected verdict.
+- Pipeline: **planner → implementer → reviewer**. The planner writes a short brief for the implementer: the issue, the steps, the pinned versions and the expected verdict.
 - The brief goes in the PR description. It is not committed.
 - Model choices come from the crew charter, `sinanawad/bot-crew` `charter/TEAM.yaml` on `main`. Joro maintains the charter. Re-read it each time; don't hard-code models here.
 
@@ -41,9 +41,8 @@ Add `scenarios/repro-<issue>/`, following the existing layout (see `scenarios/sm
 - `scenario.env`: the juju version or channel, the substrate, and pinned charm revisions.
 - `README.md`: a link to the issue, plus what counts as reproduced.
 
-Review loop:
-- A reviewer on a different model from the implementer checks the PR, round after round, until nothing blocking is left.
-- Non-trivial PRs also get an Opus challenge review.
+Review (single step):
+- The reviewer, which must be a different model from the implementer, checks the PR round after round until nothing blocking is left. There is no separate challenge review.
 - Sinan approves before the PR merges.
 
 ## 5. Run
