@@ -6,6 +6,29 @@
 set -uo pipefail
 export LC_ALL=C
 
+# ${var:?} below exits 1 before on_exit exists. Normalize that so a missing
+# input is a setup error, not the harness's "reproduced".
+PHASE=setup
+LOCKED=0
+FINISHING=0
+RC=3
+# shellcheck disable=SC2317  # trap handler; shellcheck misses it once main exits
+early_exit() {
+	ec=$?
+	trap '' EXIT
+	set +u
+	set +e
+	if [[ ${LOCKED:-0} == 0 && ${FINISHING:-0} == 0 ]]; then
+		if [[ ${PHASE:-setup} == setup ]]; then
+			ec=2
+		else
+			ec=3
+		fi
+	fi
+	exit "$ec"
+}
+trap early_exit EXIT
+
 : "${LAB_CONTROLLER:?}"
 : "${LAB_ITERATION:?}"
 : "${LAB_ARTIFACT_DIR:?}"
@@ -35,6 +58,12 @@ GATE_MISS=0
 RC=3
 RESULT=error
 REASON="unexpected exit"
+RESULT_SAVED=0
+RESULT_SAVED_RC=
+RESULT_SAVED_RESULT=
+RESULT_SAVED_REASON=
+RESULT_SAVED_PHASE=
+IN_ON_EXIT=0
 PHASE=setup
 C0=
 C1=
@@ -91,11 +120,15 @@ has_ct() {
 
 # Plan check is `dlog | grep -F … | grep -qF …`. pipefail is off in that
 # subshell so grep -q closing the pipe cannot turn a real match into SIGPIPE.
+# The debug-log pipeline is its own subshell so this pipefail does not change
+# the caller's options (the gate runs with pipefail off).
 # Stdout only: juju's stderr must not enter debug-log.txt or those greps.
 # No `|| true`: a failed debug-log keeps `dlog >file || log "… failed"` live.
 dlog() {
-	set -o pipefail
-	timeout -k 5 60 juju debug-log -m "$Q" --replay --no-tail | head -c 20M
+	(
+		set -o pipefail
+		timeout -k 5 60 juju debug-log -m "$Q" --replay --no-tail | head -c 20M
+	)
 }
 
 gate_seen() {
@@ -178,7 +211,23 @@ write_result() {
 		rm -f "$tmp"
 		return 1
 	fi
-	mv "$tmp" "$OUT/result.json"
+	mv "$tmp" "$OUT/result.json" || return 1
+	RESULT_SAVED=1
+	RESULT_SAVED_RC=$RC
+	RESULT_SAVED_RESULT=$RESULT
+	RESULT_SAVED_REASON=$REASON
+	RESULT_SAVED_PHASE=$PHASE
+}
+
+# True when result.json already records the RC/result/reason/phase we will exit with.
+# shellcheck disable=SC2317  # called only from the EXIT trap
+result_is_final() {
+	[[ ${RESULT_SAVED:-0} == 1 ]] || return 1
+	[[ ${RESULT_SAVED_RC:-} == "$RC" ]] || return 1
+	[[ ${RESULT_SAVED_RESULT:-} == "$RESULT" ]] || return 1
+	[[ ${RESULT_SAVED_REASON:-} == "$REASON" ]] || return 1
+	[[ ${RESULT_SAVED_PHASE:-} == "$PHASE" ]] || return 1
+	[[ -n ${OUT:-} && -f "$OUT/result.json" ]]
 }
 
 unprotect() {
@@ -219,10 +268,10 @@ model_absent() {
 }
 
 cleanup() {
-	# First: `local` would clobber $? and an unexpected exit would record 0.
-	trap_rc=$?
+	# Teardown only. The process status is on_exit's decision; exiting here
+	# would re-enter that handler with a status this function does not own.
 	local start elapsed
-	if [[ $CLEANED == 1 ]]; then
+	if [[ ${CLEANED:-0} == 1 ]]; then
 		return 0
 	fi
 	CLEANED=1
@@ -253,22 +302,60 @@ cleanup() {
 		fi
 		sleep 10
 	done
-	# A raw status of 1 is the harness's "reproduced". Map an unexpected death
-	# to setup-error or inconclusive instead, and make that the process status.
-	if [[ $FINISHING == 0 && $REASON == "unexpected exit" ]]; then
-		if [[ $PHASE == setup ]]; then
+	return 0
+}
+
+# EXIT wrapper. Bash keeps the status that entered the trap if the trap returns
+# or dies, and an unbound variable enters as 1, which the harness reads as
+# "reproduced". Always end in exit "$RC": a conclude()/finish() decision is
+# kept; anything earlier is 2 during setup and 3 after. result.json is written
+# for that final state when the file does not already record it. A second
+# nounset in teardown cannot replace the process status.
+# shellcheck disable=SC2317  # trap handler; shellcheck misses it once main exits
+on_exit() {
+	trap_rc=$?
+	trap '' EXIT TERM INT HUP
+	set +u
+	set +e
+	if [[ ${IN_ON_EXIT:-0} == 1 ]]; then
+		exit "${RC:-3}"
+	fi
+	IN_ON_EXIT=1
+	# No conclude() and no finish() has stored a decision yet.
+	if [[ ${LOCKED:-0} == 0 && ${FINISHING:-0} == 0 && ${REASON:-} == "unexpected exit" ]]; then
+		if [[ ${PHASE:-setup} == setup ]]; then
 			RC=2
 		else
 			RC=3
 		fi
-		if [[ -z $T_DECIDED ]]; then
+		if [[ -z ${T_DECIDED:-} ]]; then
 			T_DECIDED=$((SECONDS - T0))
 		fi
-		log "cleanup: unexpected exit status $trap_rc -> $RC"
-		write_result || log "cleanup: result.json failed"
-		exit "$RC"
+		log "on_exit: unexpected exit status ${trap_rc} -> $RC"
+	elif [[ ${trap_rc} != "$RC" ]]; then
+		log "on_exit: status ${trap_rc} discarded; keeping decided rc=$RC"
 	fi
-	return 0
+	# Retry protection removal in this shell. cleanup may have died inside
+	# unprotect and left IN_UNPROTECT=1, which would skip the backstop.
+	IN_UNPROTECT=0
+	unprotect || true
+	if [[ ${CLEANED:-0} == 0 ]]; then
+		( set -u; cleanup ) || true
+		CLEANED=1
+	fi
+	case ${RC:-} in
+	'' | *[!0-9]*)
+		if [[ ${PHASE:-setup} == setup ]]; then
+			RC=2
+		else
+			RC=3
+		fi
+		;;
+	esac
+	if ! result_is_final; then
+		write_result || true
+	fi
+	exit "$RC"
 }
 
 finish() {
@@ -641,7 +728,7 @@ main() {
 	conclude 3 error "fell off the end"
 }
 
-trap cleanup EXIT
+trap on_exit EXIT
 trap 'finish 124 error "terminated"' TERM INT HUP
 
 case $LAB_TIMEOUT_MIN in
