@@ -4,7 +4,7 @@ Disposable, public Juju test lab run on GitHub Actions. Owner: @sinanawad. Opera
 
 ## Purpose (for agents)
 - Run **live Juju** scenarios that cannot run on Blondie's box (no systemd/snapd there): bootstrap a controller on **LXD** (machine charms) or **MicroK8s** (k8s charms), run a scenario, collect logs, write a verdict.
-- Typical uses: quick sanity checks; reproduce a juju/juju issue; verify a fix; compare versions (last-good vs first-bad) across snap channels or juju/juju tags/SHAs (build mode, 4.0/4.1 only in v1).
+- Typical uses: quick sanity checks; reproduce a juju/juju issue; verify a fix; compare versions (last-good vs first-bad) across snap channels or sinanawad/juju SHAs or release branches (build mode, 4.0/4.1 only in v1).
 - Every run starts from a clean GitHub-hosted runner. Nothing persists between runs except uploaded artifacts (7 days) and the run's job summary.
 - Builds, unit tests and `git bisect` of juju/juju happen on Blondie's box, not here. This repo is only for things that need a running Juju.
 
@@ -63,7 +63,7 @@ Scrub (before upload): `scrub.sh` copies `LAB_ARTIFACT_DIR` into a fresh `LAB_UP
 1. Pick or add a scenario (add via PR).
 2. Dispatch via REST so the run id comes back: `gh api -X POST repos/sinanawad/blondie-lab/actions/workflows/lab-lxd.yml/dispatches -f ref=main -F return_run_details=true -f 'inputs[scenario]=<name>' -f 'inputs[juju_channel]=4.0/stable' -f 'inputs[request_id]=<uuid>'`.
 3. Watch `GET /repos/sinanawad/blondie-lab/actions/runs/<id>`; download the artifact and read `verdict.json`, not the job colour.
-4. To bisect across versions, dispatch the same scenario per channel or per tag via `ref`, then record last-good and first-bad with run URLs and pinned SHAs. A setup-error, error or inconclusive point is a gap, not a result.
+4. To bisect across versions, dispatch the same scenario per channel or per sinanawad/juju SHA or release branch via `ref`, then record last-good and first-bad with run URLs and pinned SHAs. A setup-error, error or inconclusive point is a gap, not a result.
 5. Cite run URLs as evidence in triage notes. Logs are public, so check them before sharing.
 
 The full design and implementation plan are kept in Blondie's private notes (`docs/blondie-lab-design.md`, `docs/blondie-lab-plan.md` in sinanawad/blondie-devenv).
