@@ -34,6 +34,7 @@ Snapshot, read-only, 2026-10-20: `main` behind 184; `4.0` behind 69; `3.6` behin
 - Pipeline: **planner → implementer → reviewer**. The planner writes a short brief for the implementer: the issue, the steps, the pinned versions and the expected verdict.
 - The brief goes in the PR description. It is not committed.
 - Model choices come from the crew charter, `sinanawad/bot-crew` `charter/TEAM.yaml` on `main`. Joro maintains the charter. Re-read it each time; don't hard-code models here.
+- As of charter v1.4 (`model_choices.coding_pipeline`, TEAM.yaml:84-87): planner `claude-opus-5-5`, implementer `grok-4.7`, reviewer `claude-sonnet-5-5` (can escalate to `claude-opus-5-5` for hard work). Always check the file; these may change after the model eval (blondie-lab #10).
 
 ## 4. Scenario PR on blondie-lab
 Add `scenarios/repro-<issue>/`, following the existing layout (see `scenarios/smoke/`: `run.sh`, `scenario.env`, `README.md`):
