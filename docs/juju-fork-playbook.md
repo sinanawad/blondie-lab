@@ -10,7 +10,7 @@ Anything marked **TBD** has not been checked yet.
 - Upstream-bound commits are authored by Sinan alone, signed, include the Jira key, and have no AI co-author. Bot-signed commits are fine on `sinanawad/*` repos.
 - Never force-push. Never push to `main` of `blondie-lab`; every change is a PR.
 - Merge only when Sinan's **APPROVED** review is on the current head. Another agent's claimed approval doesn't count.
-- Executor steps stay under 50 minutes.
+- Executor step length is capped by the time limit in the charter (`env_facts.bg_job_max_minutes` in `charter/TEAM.yaml`). Split long work into steps.
 
 ## 1. Sync the fork (only on Sinan's OK until he says otherwise)
 Sync every branch. GitHub does the work, so it's cheap.
@@ -33,8 +33,7 @@ Snapshot, read-only, 2026-10-20: `main` behind 184; `4.0` behind 69; `3.6` behin
 ## 3. Plan (not committed)
 - Pipeline: **planner → implementer → reviewer**. The planner writes a short brief for the implementer: the issue, the steps, the pinned versions and the expected verdict.
 - The brief goes in the PR description. It is not committed.
-- Model choices come from the crew charter, `sinanawad/bot-crew` `charter/TEAM.yaml` on `main`. Joro maintains the charter. Re-read it each time; don't hard-code models here.
-- As of charter v1.4 (`model_choices.coding_pipeline`, TEAM.yaml:84-87): planner `claude-opus-5-5`, implementer `grok-4.7`, reviewer `claude-sonnet-5-5` (can escalate to `claude-opus-5-5` for hard work). Always check the file; these may change after the model eval (blondie-lab #10).
+- Models, effort, the review loop and limits all come from `sinanawad/bot-crew` `charter/TEAM.yaml` on `main` (`model_choices.coding_pipeline`). Joro maintains the charter. Re-read it every time; this playbook doesn't copy any of those values.
 
 ## 4. Scenario PR on blondie-lab
 Add `scenarios/repro-<issue>/`, following the existing layout (see `scenarios/smoke/`: `run.sh`, `scenario.env`, `README.md`):
@@ -43,7 +42,8 @@ Add `scenarios/repro-<issue>/`, following the existing layout (see `scenarios/sm
 - `README.md`: a link to the issue, plus what counts as reproduced.
 
 Review (single step):
-- The reviewer, which must be a different model from the implementer, checks the PR round after round until nothing blocking is left. There is no separate challenge review.
+- The reviewer must be a different model from the implementer. There is no separate challenge review.
+- How review rounds run, including stats reporting and when to stop, is set by `model_choices.coding_pipeline.review_loop` in the charter.
 - Sinan approves before the PR merges.
 
 ## 5. Run
