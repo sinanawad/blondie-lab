@@ -54,7 +54,14 @@ LOCKED=0
 PROTECTED=0
 UNPROTECTED_DONE=0
 IN_UNPROTECT=0
-GATE_MISS=0
+# Test-only knobs (REPRO_STALE_S, REPRO_POLL_S, REPRO_BACKOFF_POLL_S).
+# The workflow never sets them; same precedent as run-scenario.sh.
+BACKOFF_EXITS=12
+EXITS=0
+EXITS_AT_REMOVE1=
+STALE_S=${REPRO_STALE_S:-120}
+POLL_S=${REPRO_POLL_S:-10}
+BPOLL_S=${REPRO_BACKOFF_POLL_S:-2}
 RC=3
 RESULT=error
 REASON="unexpected exit"
@@ -105,6 +112,22 @@ lxc_names() {
 	timeout -k 5 30 lxc list --project default --format json | jq -r '.[].name'
 }
 
+# lxc_snapshot <file>: instance name, status and the delete-protection flag only.
+# Raw `lxc list` JSON carries cloud-init secrets and key material (scrub blocks the upload).
+lxc_snapshot() {
+	local f=$1
+	if (
+		set -o pipefail
+		timeout -k 5 30 lxc list --project default --format json |
+			jq -c '[.[] | {name, status, protection_delete: (.config["security.protection.delete"] // null)}]'
+	) >"$f.tmp"; then
+		mv "$f.tmp" "$f"
+	else
+		rm -f "$f.tmp"
+		return 1
+	fi
+}
+
 has_machine() {
 	local id=$1 st
 	st=$(status_json) || return 2
@@ -121,7 +144,7 @@ has_ct() {
 # Plan check is `dlog | grep -F … | grep -qF …`. pipefail is off in that
 # subshell so grep -q closing the pipe cannot turn a real match into SIGPIPE.
 # The debug-log pipeline is its own subshell so this pipefail does not change
-# the caller's options (the gate runs with pipefail off).
+# the caller's options (the batch check runs with pipefail off).
 # Stdout only: juju's stderr must not enter debug-log.txt or those greps.
 # No `|| true`: a failed debug-log keeps `dlog >file || log "… failed"` live.
 dlog() {
@@ -131,11 +154,11 @@ dlog() {
 	)
 }
 
-gate_seen() {
-	(
-		set +o pipefail
-		dlog | grep -F "failed to remove containers:" | grep -qF "$C0"
-	)
+# One counted line per failed provisioner run: the exit log names C0.
+exit_count() {
+	local txt
+	txt=$(dlog) || return 2
+	EXITS=$(grep -F "exiting provisioner task loop" <<<"$txt" | grep -F "failed to remove containers" | grep -cF -- "$C0" || true)
 }
 
 record_batched() {
@@ -179,6 +202,7 @@ write_result() {
 		--arg batched "$BATCHED" \
 		--arg release_converged "$RELEASE_CONVERGED" \
 		--arg release_s "$RELEASE_S" \
+		--arg exits_before_remove1 "$EXITS_AT_REMOVE1" \
 		--argjson exit_code "$RC" \
 		'def s($v): if $v == "" then null else $v end;
 		 def n($v): if $v == "" then null else ($v | tonumber) end;
@@ -205,6 +229,8 @@ write_result() {
 		   },
 		   observed: {m0: b($m0), m1: b($m1), c0: b($oc0), c1: b($oc1)},
 		   batched: b($batched),
+		   exits_before_remove1: n($exits_before_remove1),
+		   backoff_exits_required: 12,
 		   release_converged: b($release_converged),
 		   release_s: n($release_s)
 		 }' >"$tmp"; then
@@ -280,11 +306,10 @@ cleanup() {
 	# (b) diagnostics before destroy. collect.sh only sees models that still exist.
 	log "cleanup: diagnostics"
 	dlog >"$OUT/debug-log.txt" || log "cleanup: debug-log failed"
-	grep -E 'stopping known instances|failed to remove containers|shutting down pool|exiting provisioner task loop|removing dead machine' \
+	grep -E 'stopping known instances|failed to remove containers|shutting down pool|exiting provisioner task loop|entering provisioner task loop|removing dead machine' \
 		"$OUT/debug-log.txt" >"$OUT/provisioner-lines.txt" || true
 	status_json >"$OUT/status-final.json" || log "cleanup: final status failed"
-	timeout -k 5 30 lxc list --project default --format json >"$OUT/lxc-final.json" ||
-		log "cleanup: final lxc list failed"
+	lxc_snapshot "$OUT/lxc-final.json" || log "cleanup: final lxc list failed"
 	# (c) destroy. Failures are logged and do not change RC.
 	log "cleanup: destroy-model $Q"
 	timeout -k 5 120 juju destroy-model --no-prompt --destroy-storage --force --no-wait "$Q" ||
@@ -505,29 +530,14 @@ machines_ready() {
 	return 0
 }
 
-gate_ready() {
-	local hm hc
-	if ! gate_seen; then
-		return 1
-	fi
-	has_machine 0
-	hm=$?
-	has_ct "$C0"
-	hc=$?
-	if ((hm > 1 || hc > 1)); then
-		return 1
-	fi
-	if ((hm == 1 || hc == 1)); then
-		GATE_MISS=1
-		return 1
-	fi
-	return 0
-}
-
-wait_gate() {
-	local limit=240 start=$SECONDS
+# Restart delay is 3s × 1.2^(k−1), so after 12 failing exits the provisioner
+# is down for ≥ 20s. Poll debug-log until a fresh exit count reaches that,
+# then remove-machine 1 while the task is still down. No presence checks here.
+wait_backoff() {
+	local limit=420 start=$SECONDS
+	local prev_ok=0 prev_exits=0 prev_end=$SECONDS
 	while :; do
-		local elapsed remain phase_left budget nap
+		local elapsed remain phase_left budget nap age
 		elapsed=$((SECONDS - start))
 		remain=$(left)
 		phase_left=$((limit - elapsed))
@@ -541,18 +551,41 @@ wait_gate() {
 		if ((budget <= 0)); then
 			return 1
 		fi
-		if gate_ready; then
-			return 0
+		if exit_count; then
+			if [[ -z $T_GATE ]] && ((EXITS >= 1)); then
+				T_GATE=$((SECONDS - T0))
+			fi
+			if ((prev_ok == 1 && EXITS >= BACKOFF_EXITS && EXITS > prev_exits)); then
+				age=$((SECONDS - prev_end))
+				if ((age <= BPOLL_S + 4)); then
+					EXITS_AT_REMOVE1=$EXITS
+					return 0
+				fi
+			fi
+			prev_ok=1
+			prev_exits=$EXITS
+			prev_end=$SECONDS
+		else
+			prev_ok=0
 		fi
-		if [[ $GATE_MISS == 1 ]]; then
-			return 1
+		remain=$(left)
+		elapsed=$((SECONDS - start))
+		phase_left=$((limit - elapsed))
+		if ((phase_left < 0)); then
+			phase_left=0
 		fi
-		nap=10
+		budget=$phase_left
+		if ((remain < budget)); then
+			budget=$remain
+		fi
+		nap=$BPOLL_S
 		if ((budget < nap)); then
 			nap=$budget
 		fi
 		if ((nap > 0)); then
 			sleep "$nap"
+		else
+			return 1
 		fi
 	done
 }
@@ -601,9 +634,9 @@ classify() {
 			T_C1_GONE=$((T_C1_GONE_AT - T0))
 			log "observe: container 1 gone at t=${T_C1_GONE}s"
 		fi
-		if ((SECONDS - T_C1_GONE_AT >= 120)); then
+		if ((SECONDS - T_C1_GONE_AT >= STALE_S)); then
 			record_batched
-			conclude 1 reproduced "machine 1 record remained 120s after its container was removed"
+			conclude 1 reproduced "machine 1 record remained ${STALE_S}s after its container was removed"
 		fi
 		if [[ $ended == 1 ]]; then
 			record_batched
@@ -656,7 +689,7 @@ observe() {
 		else
 			log "observe: read failed"
 		fi
-		nap=10
+		nap=$POLL_S
 		if ((budget < nap)); then
 			nap=$budget
 		fi
@@ -699,8 +732,7 @@ main() {
 		finish 2 error "protection not confirmed"
 	fi
 	status_json >"$OUT/status-before.json" || finish 2 error "status snapshot failed"
-	timeout -k 5 30 lxc list --project default --format json >"$OUT/lxc-before.json" ||
-		finish 2 error "lxc snapshot failed"
+	lxc_snapshot "$OUT/lxc-before.json" || finish 2 error "lxc snapshot failed"
 	if (($(left) <= 0)); then
 		finish 2 error "budget exhausted before repro"
 	fi
@@ -711,12 +743,11 @@ main() {
 	fi
 	T_REMOVE0=$((SECONDS - T0))
 	log "remove-machine 0 accepted at t=${T_REMOVE0}s"
-	log "wait for removal gate"
-	if wait_gate; then
-		T_GATE=$((SECONDS - T0))
-		log "gate met at t=${T_GATE}s"
+	log "wait for provisioner backoff (exits>=$BACKOFF_EXITS)"
+	if wait_backoff; then
+		log "backoff: exits=$EXITS at t=$((SECONDS - T0))s"
 	else
-		conclude 3 error "precondition not reached"
+		conclude 3 error "precondition not reached (exits=$EXITS)"
 	fi
 	log "remove-machine 1"
 	if ! timeout -k 5 90 juju remove-machine -m "$Q" --no-prompt 1; then
@@ -737,6 +768,18 @@ esac
 case $LAB_ITERATION in
 '' | *[!0-9]*) finish 2 error "bad LAB_ITERATION" ;;
 esac
+case $STALE_S in
+'' | *[!0-9]*) finish 2 error "bad REPRO_* knob" ;;
+esac
+case $POLL_S in
+'' | *[!0-9]*) finish 2 error "bad REPRO_* knob" ;;
+esac
+case $BPOLL_S in
+'' | *[!0-9]*) finish 2 error "bad REPRO_* knob" ;;
+esac
+if ((STALE_S < 1 || POLL_S < 1 || BPOLL_S < 1)); then
+	finish 2 error "bad REPRO_* knob"
+fi
 END=$((T0 + LAB_TIMEOUT_MIN * 60 - 360))
 
 main
