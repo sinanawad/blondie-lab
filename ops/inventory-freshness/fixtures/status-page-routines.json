@@ -1,0 +1,9 @@
+[
+  {
+    "name": "status-render",
+    "enabled": true,
+    "folder": "status",
+    "last_run": "2026-11-02T05:30:00+02:00",
+    "status": "succeeded"
+  }
+]

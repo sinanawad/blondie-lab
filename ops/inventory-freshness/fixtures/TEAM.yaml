@@ -1,0 +1,5 @@
+# Fixture excerpt for inventory-freshness. Not the live charter.
+# The indented version is a decoy: only a top-level version: line counts.
+notes:
+  version: "9.9.9"
+version: "1.10.12"
