@@ -1,0 +1,39 @@
+[
+  {
+    "name": "summer-sweep",
+    "enabled": true,
+    "folder": "joro",
+    "last_run": "2026-07-15T06:00:00+03:00",
+    "status": "succeeded",
+    "bot": "joro",
+    "schedule": "0 6 * * *",
+    "note": "extra keys are not checked"
+  },
+  {
+    "name": "winter-sweep",
+    "enabled": true,
+    "folder": "joro",
+    "last_run": "2026-01-15T06:00:00+02:00",
+    "status": "succeeded",
+    "bot": "joro",
+    "schedule": "0 6 * * *"
+  },
+  {
+    "name": "dormant",
+    "enabled": false,
+    "folder": "joro",
+    "last_run": null,
+    "status": "never_run",
+    "bot": "joro",
+    "schedule": "0 6 * * *"
+  },
+  {
+    "name": "live-pass",
+    "enabled": true,
+    "folder": "joro",
+    "last_run": "2026-11-02T05:00:00+02:00",
+    "status": "running",
+    "bot": "joro",
+    "schedule": "0 6 * * *"
+  }
+]

@@ -75,6 +75,9 @@ jobs:
       - name: Harness unit tests (offline)
         run: scripts/test-harness.sh
 
+      - name: Inventory freshness unit tests (offline)
+        run: python3 -m unittest discover -s ops/inventory-freshness -p 'test_*.py'
+
       - name: Linters still fail on lint-fixtures/
         env:
           GH_TOKEN: ${{ github.token }}
