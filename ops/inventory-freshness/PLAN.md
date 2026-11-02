@@ -71,7 +71,7 @@ with Python 3.12).
 |---|---|---|
 | `charter.unreadable` | `TEAM.yaml` reads and has a top-level `version:` | Missing file or no match for `^version:\s*["']?v?([0-9][0-9A-Za-z.\-]*)`. The version comparison is then skipped for all brains; the other brain checks still run |
 | `brains.missing` | `<bot>-brain.md` exists | Absent |
-| `brains.no-mirror` | The header has `Charter mirror: v<version>` | No match for `Charter mirror: v(\S+)` in the first 20 lines |
+| `brains.no-mirror` | The header has `Charter mirror: v<version>` | No match for `Charter mirror:\s*v([0-9][0-9A-Za-z]*(?:\.[0-9A-Za-z]+)*)` in the first 20 lines. A trailing period or markdown `**` is not part of the token |
 | `brains.charter-mismatch` | The mirror version equals the `TEAM.yaml` version | The strings differ after a leading `v` is stripped (exact string compare, no semver ordering) |
 | `brains.stale` | mtime is at most 8 days old | `now - st_mtime > 8 * 86400` s (strictly older than 8 days) |
 
@@ -101,7 +101,7 @@ Default stdout has one line per yellow, then a summary line. The grammar is fixe
 (`YELLOW <check> <subject>: <detail>`), so the output can also be grepped:
 
 ```
-YELLOW routines.last-run-offset routines/scout.json[2] "nightly-sweep": last_run 2026-11-01T06:00:00-05:00 has offset -05:00 (Cancun); Europe/Sofia is +02:00 at that instant
+YELLOW routines.last-run-offset routines/scout.json[2] "nightly-sweep": last_run "2026-11-01T06:00:00-05:00" has offset -05:00 (Cancun); Europe/Sofia is +02:00 at that instant
 YELLOW brains.charter-mismatch brains/hunter-brain.md: Charter mirror v1.10.11, TEAM.yaml v1.10.12
 YELLOW brains.stale brains/drill-brain.md: mtime 2026-10-23T05:10:00+03:00 is 9.9 days old (> 8)
 inventory-freshness: 3 yellow (charter v1.10.12, now 2026-11-02T06:00:04+02:00)

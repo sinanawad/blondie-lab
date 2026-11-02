@@ -68,7 +68,9 @@ one JSON object and no summary line.
 
 `INVENTORY_BRAINS_BOTS` is a space-separated list of bot names (charter
 v1.10.12 `brains.files`). `INVENTORY_BRAINS_STALE_DAYS` is an integer count of
-86400-second days (charter `brains.stale`). `INVENTORY_NOW`, when set, is an
+86400-second days (charter `brains.stale`). A value that is not an integer
+writes one stderr line, `INVENTORY_BRAINS_STALE_DAYS is not an integer, using 8`,
+and the check uses 8. `INVENTORY_NOW`, when set, is an
 ISO-8601 instant with an offset. Tests use it to pin the clock. The summary
 prints that instant in Europe/Sofia local time.
 
@@ -83,7 +85,7 @@ The script prints the ASCII word `YELLOW`. It does not print an emoji. Human
 lines use the grammar `YELLOW <check> <subject>: <detail>`:
 
 ```
-YELLOW routines.last-run-offset routines/scout.json[2] "nightly-sweep": last_run 2026-11-01T06:00:00-05:00 has offset -05:00 (Cancun); Europe/Sofia is +02:00 at that instant
+YELLOW routines.last-run-offset routines/scout.json[2] "nightly-sweep": last_run "2026-11-01T06:00:00-05:00" has offset -05:00 (Cancun); Europe/Sofia is +02:00 at that instant
 YELLOW brains.charter-mismatch brains/hunter-brain.md: Charter mirror v1.10.11, TEAM.yaml v1.10.12
 YELLOW brains.stale brains/drill-brain.md: mtime 2026-10-24T07:00:00+03:00 is 9.0 days old (> 8)
 inventory-freshness: 3 yellow (charter v1.10.12, now 2026-11-02T06:00:00+02:00)
@@ -95,8 +97,10 @@ Routine indexes are 0-based. A quoted routine `name` is included when that
 field is a string. `charter unknown` means `TEAM.yaml` could not be read or
 had no top-level `version:`.
 
-An offset of `-05:00` is labeled Cancun in the detail. `Z` and `+00:00` are
-offset failures, not format failures. On the October fall-back day, both
+An offset of `-05:00` is labeled Cancun in the detail. `last_run` is quoted
+the same way as a routine name, with newlines escaped, so the value cannot
+break into a second line. A trailing `Z` is read as `+00:00` before parsing.
+`Z` and `+00:00` are offset failures, not format failures. On the October fall-back day, both
 `03:30+03:00` and `03:30+02:00` pass when each is Europe/Sofia's real offset
 at that instant. A brain file exactly 8 days old passes. Only an age strictly
 older than `INVENTORY_BRAINS_STALE_DAYS` is yellow. Age is elapsed seconds
@@ -137,8 +141,11 @@ that did not fire.
 | `brains.stale` | mtime is strictly older than the stale-day limit |
 
 Version compare is an exact string compare, not semver ordering. `1.10.12`
-and `v1.10.12` both match a mirror of `v1.10.12`. The version line is read
-with the top-level regex in `PLAN.md` only. When the charter version cannot
+and `v1.10.12` both match a mirror of `v1.10.12`. The mirror token is
+`Charter mirror:` plus optional space plus `v` and a dotted version. A
+trailing period (`v1.10.12.`) and markdown bold (`**Charter mirror: v1.10.12**`)
+are not part of the token, so both match `1.10.12`. The version line in
+`TEAM.yaml` is read with the top-level regex in `PLAN.md` only. When the charter version cannot
 be read, mismatch checks are skipped. Missing and stale brain checks still run.
 Routine files are not limited to `INVENTORY_BRAINS_BOTS`. Every `*.json` in
 the routines directory is checked, plus `status-page-routines.json`.

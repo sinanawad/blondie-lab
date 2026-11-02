@@ -25,7 +25,9 @@ DEFAULT_BOTS = "joro blondie scout bones marty hunter drill sisyphus"
 DEFAULT_STALE_DAYS = "8"
 
 VERSION_RE = re.compile(r"""^version:\s*["']?v?([0-9][0-9A-Za-z.\-]*)""")
-MIRROR_RE = re.compile(r"Charter mirror: v(\S+)")
+MIRROR_RE = re.compile(
+    r"Charter mirror:\s*v([0-9][0-9A-Za-z]*(?:\.[0-9A-Za-z]+)*)"
+)
 REQUIRED_FIELDS = ("name", "enabled", "folder", "last_run", "status")
 STATUSES = {"succeeded", "failed", "never_run", "running"}
 HEADER_LINES = 20
@@ -228,14 +230,18 @@ def check_last_run(report, base_label, owner, element, index, name, zone):
             f"last_run is {type_name(last_run)}, expected an ISO-8601 timestamp with an offset",
         )
         return
+    shown = quote_name(last_run)
+    # A trailing Z is UTC. Older Pythons reject it in fromisoformat, which would
+    # report a format yellow instead of an offset yellow.
+    normalized = last_run[:-1] + "+00:00" if last_run.endswith("Z") else last_run
     try:
-        parsed = datetime.fromisoformat(last_run)
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
         report.add(
             "routines.last-run-format",
             subject,
             owner,
-            f'last_run "{last_run}" is not an ISO-8601 timestamp',
+            f"last_run {shown} is not an ISO-8601 timestamp",
         )
         return
     if parsed.utcoffset() is None:
@@ -243,7 +249,7 @@ def check_last_run(report, base_label, owner, element, index, name, zone):
             "routines.last-run-format",
             subject,
             owner,
-            f"last_run {last_run} has no offset",
+            f"last_run {shown} has no offset",
         )
         return
     expected = europe_sofia_offset(parsed, zone)
@@ -256,7 +262,7 @@ def check_last_run(report, base_label, owner, element, index, name, zone):
         "routines.last-run-offset",
         subject,
         owner,
-        f"last_run {last_run} has offset {got}{cancun}; Europe/Sofia is {want} at that instant",
+        f"last_run {shown} has offset {got}{cancun}; Europe/Sofia is {want} at that instant",
     )
 
 
@@ -524,7 +530,15 @@ def bot_names():
 
 
 def stale_day_limit():
-    return int(os.environ.get("INVENTORY_BRAINS_STALE_DAYS", DEFAULT_STALE_DAYS))
+    raw = os.environ.get("INVENTORY_BRAINS_STALE_DAYS", DEFAULT_STALE_DAYS)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        os.write(
+            2,
+            f"INVENTORY_BRAINS_STALE_DAYS is not an integer, using {DEFAULT_STALE_DAYS}\n".encode(),
+        )
+        return int(DEFAULT_STALE_DAYS)
 
 
 def emit(report, charter_version, now, zone, as_json):

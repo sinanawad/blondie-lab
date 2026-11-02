@@ -148,7 +148,7 @@ class InventoryFreshnessTests(unittest.TestCase):
             values.update(extra)
         return values
 
-    def run_check(self, extra_env=None):
+    def run_check(self, extra_env=None, stderr=""):
         env = self.env(extra_env)
         command = [sys.executable, str(SCRIPT)]
         json_proc = subprocess.run(
@@ -167,8 +167,8 @@ class InventoryFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(json_proc.returncode, 0, json_proc.stderr + json_proc.stdout)
         self.assertEqual(human_proc.returncode, 0, human_proc.stderr + human_proc.stdout)
-        self.assertEqual(json_proc.stderr, "")
-        self.assertEqual(human_proc.stderr, "")
+        self.assertEqual(json_proc.stderr, stderr)
+        self.assertEqual(human_proc.stderr, stderr)
         self.assertNotIn("\U0001f7e1", json_proc.stdout)
         self.assertNotIn("\U0001f7e1", human_proc.stdout)
         try:
@@ -259,7 +259,7 @@ class InventoryFreshnessTests(unittest.TestCase):
         subject = routine_subject("scout.json", 2, "nightly-sweep")
         self.assertEqual(pairs, [("routines.last-run-offset", subject)])
         detail = (
-            "last_run 2026-11-01T06:00:00-05:00 has offset -05:00 (Cancun); "
+            'last_run "2026-11-01T06:00:00-05:00" has offset -05:00 (Cancun); '
             "Europe/Sofia is +02:00 at that instant"
         )
         self.assertEqual(data["yellows"][0]["detail"], detail)
@@ -278,7 +278,7 @@ class InventoryFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(
             data["yellows"][0]["detail"],
-            "last_run 2026-11-01T06:00:00Z has offset +00:00; "
+            'last_run "2026-11-01T06:00:00Z" has offset +00:00; '
             "Europe/Sofia is +02:00 at that instant",
         )
         self.assertNotIn("Cancun", data["yellows"][0]["detail"])
@@ -302,7 +302,7 @@ class InventoryFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(
             data["yellows"][0]["detail"],
-            "last_run 2026-07-15T06:00:00+02:00 has offset +02:00; "
+            'last_run "2026-07-15T06:00:00+02:00" has offset +02:00; '
             "Europe/Sofia is +03:00 at that instant",
         )
 
@@ -315,7 +315,7 @@ class InventoryFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(
             data["yellows"][0]["detail"],
-            "last_run 2026-01-15T06:00:00+03:00 has offset +03:00; "
+            'last_run "2026-01-15T06:00:00+03:00" has offset +03:00; '
             "Europe/Sofia is +02:00 at that instant",
         )
 
@@ -328,7 +328,7 @@ class InventoryFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(
             data["yellows"][0]["detail"],
-            "last_run 2026-11-01T06:00:00 has no offset",
+            'last_run "2026-11-01T06:00:00" has no offset',
         )
 
     def test_unparseable_last_run(self):
@@ -342,6 +342,24 @@ class InventoryFreshnessTests(unittest.TestCase):
             data["yellows"][0]["detail"],
             'last_run "yesterday" is not an ISO-8601 timestamp',
         )
+
+    def test_last_run_newline_cannot_forge_a_line(self):
+        self.put_json(
+            "scout.json",
+            [element(last_run="yesterday\nYELLOW forged: hi")],
+        )
+        data, pairs = self.run_check()
+        self.assertEqual(
+            pairs,
+            [("routines.last-run-format", routine_subject("scout.json", 0, "nightly-sweep"))],
+        )
+        detail = data["yellows"][0]["detail"]
+        self.assertEqual(
+            detail,
+            'last_run "yesterday\\nYELLOW forged: hi" is not an ISO-8601 timestamp',
+        )
+        self.assertNotIn("\n", detail)
+        self.assertNotIn("\n", data["yellows"][0]["line"])
 
     def test_last_run_number(self):
         self.put_json("scout.json", [element(last_run=1730000000)])
@@ -585,7 +603,7 @@ class InventoryFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(
             data["yellows"][0]["detail"],
-            "last_run 2026-03-29T04:00:00+02:00 has offset +02:00; "
+            'last_run "2026-03-29T04:00:00+02:00" has offset +02:00; '
             "Europe/Sofia is +03:00 at that instant",
         )
 
@@ -740,6 +758,19 @@ class InventoryFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(data["yellows"][0]["owner"], "hunter")
 
+    def test_mirror_trailing_period_matches_team_version(self):
+        for bot in ("drill", "hunter", "marty"):
+            self.write_brain(bot, f"# {bot} brain\n\nCharter mirror: v1.10.12.\n")
+        data, pairs = self.run_check()
+        self.assertEqual(pairs, [])
+        self.assertEqual(data["charter_version"], "1.10.12")
+
+    def test_bold_markdown_mirror_matches_team_version(self):
+        self.write_brain("scout", "# scout brain\n\n**Charter mirror: v1.10.12**\n")
+        data, pairs = self.run_check()
+        self.assertEqual(pairs, [])
+        self.assertEqual(data["charter_version"], "1.10.12")
+
     def test_brain_stale_at_9_days(self):
         self.set_brain_ages(9, ["drill"])
         data, pairs = self.run_check()
@@ -752,6 +783,15 @@ class InventoryFreshnessTests(unittest.TestCase):
     def test_brain_exactly_8_days_passes(self):
         self.set_brain_ages(8, ["sisyphus"])
         self.assertEqual(self.run_check()[1], [])
+
+    def test_bad_stale_days_falls_back_to_eight(self):
+        self.set_brain_ages(9, ["drill"])
+        self.set_brain_ages(8, ["sisyphus"])
+        _, pairs = self.run_check(
+            extra_env={"INVENTORY_BRAINS_STALE_DAYS": "nope"},
+            stderr="INVENTORY_BRAINS_STALE_DAYS is not an integer, using 8\n",
+        )
+        self.assertEqual(pairs, [("brains.stale", "brains/drill-brain.md")])
 
     def test_stale_days_env_override(self):
         self.set_brain_ages(9, ["drill"])
