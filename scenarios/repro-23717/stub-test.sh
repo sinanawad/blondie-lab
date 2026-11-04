@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline stand-in for repro-23717: fake juju, five modes, scrub check.
+# Offline stand-in for repro-23717: fake juju with a private /tmp, scrub check.
 # Run: bash scenarios/repro-23717/stub-test.sh
 set -euo pipefail
 export LC_ALL=C
@@ -7,7 +7,7 @@ export LC_ALL=C
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'chmod 755 "$tmp/priv-mkdir-fail/ro" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/bin"
 
@@ -34,12 +34,41 @@ file_arg() {
 	return 1
 }
 
+# Stand-in for the snap's home interface: only paths under FAKE_READABLE
+# (the mode dir, playing the role of $HOME) are visible.
+readable() { [[ -f $1 ]] && case $1 in "$FAKE_READABLE"/*) true ;; *) false ;; esac; }
+
+note_cloud_place() {
+	case $1 in
+	"$LAB_ARTIFACT_DIR" | "$LAB_ARTIFACT_DIR"/*)
+		echo cloud-in-artifacts >>"$state/calls.log"
+		;;
+	*)
+		echo cloud-outside-artifacts >>"$state/calls.log"
+		;;
+	esac
+}
+
+refuse_unreadable() {
+	local f=$1
+	if [[ -f $f ]]; then
+		typ=$(sed -n 's/^[[:space:]]*type:[[:space:]]*//p' "$f" | head -n 1)
+		printf 'add-cloud-type %s\n' "$typ" >>"$state/calls.log"
+	fi
+	echo "ERROR open $f: no such file or directory" >&2
+	exit 1
+}
+
 case $cmd in
 add-cloud)
 	f=$(file_arg "$@") || {
 		echo "fake juju: add-cloud without -f" >&2
 		exit 99
 	}
+	note_cloud_place "$f"
+	if [[ $mode == snap-unreadable ]] || ! readable "$f"; then
+		refuse_unreadable "$f"
+	fi
 	typ=$(sed -n 's/^[[:space:]]*type:[[:space:]]*//p' "$f" | head -n 1)
 	printf 'add-cloud-type %s\n' "$typ" >>"$state/calls.log"
 	case $mode in
@@ -62,6 +91,7 @@ add-credential)
 		echo "fake juju: add-credential without -f" >&2
 		exit 99
 	}
+	readable "$f" || { echo "ERROR open $f: no such file or directory" >&2; exit 1; }
 	case $f in
 	"$LAB_ARTIFACT_DIR" | "$LAB_ARTIFACT_DIR"/*)
 		echo cred-in-artifacts >>"$state/calls.log"
@@ -223,7 +253,7 @@ run_mode() {
 	: >"$dir/state/calls.log"
 	local ec=0
 	set +e
-	FAKE_STATE=$dir/state FAKE_MODE=$mode PATH="$tmp/bin:$PATH" \
+	FAKE_STATE=$dir/state FAKE_MODE=$mode FAKE_READABLE=$dir PATH="$tmp/bin:$PATH" \
 		LAB_CONTROLLER=lab LAB_ITERATION=1 LAB_ARTIFACT_DIR=$dir/art \
 		LAB_TIMEOUT_MIN=20 LAB_JUJU_VERSION=4.0.0 LAB_JUJU_GIT_COMMIT=abc23717 \
 		bash "$here/run.sh" >"$dir/log/stdout" 2>"$dir/log/stderr"
@@ -256,23 +286,101 @@ print(f"ok: {mode} cleanup remove-credential then remove-cloud")
 PY
 }
 
-assert_temp_gone() {
-	local mode=$1
-	python3 - "$tmp/$mode/state/calls.log" "$mode" "$tmp/$mode/art" << 'PY'
+assert_cloud_files() {
+	local mode=$1 art
+	art=$(art_of "$mode")
+	python3 - "$tmp/$mode/state/calls.log" "$mode" "$art" << 'PY'
 import os, re, sys
-text = open(sys.argv[1]).read()
+lines = open(sys.argv[1]).read().splitlines()
 mode, art = sys.argv[2], os.path.realpath(sys.argv[3])
-paths = re.findall(r'(?:^|\s)-f (\S+)', text)
-if not paths:
-    raise SystemExit(f"{mode}: no -f path in calls")
-dirs = {os.path.dirname(p) for p in paths}
-for d in dirs:
-    if os.path.exists(d):
-        raise SystemExit(f"{mode}: temp dir still exists: {d}")
-    real = os.path.realpath(d)
-    if real == art or real.startswith(art + os.sep):
-        raise SystemExit(f"{mode}: credential dir is inside artifacts: {d}")
-print(f"ok: {mode} temp dir removed")
+if "cloud-in-artifacts" not in lines:
+    raise SystemExit(f"{mode}: missing cloud-in-artifacts")
+if "cloud-outside-artifacts" in lines:
+    raise SystemExit(f"{mode}: cloud-outside-artifacts")
+adds = [ln for ln in lines if ln.startswith("juju add-cloud ")]
+if not adds:
+    raise SystemExit(f"{mode}: no add-cloud")
+for ln in adds:
+    m = re.search(r'(?:^|\s)-f (\S+)', ln)
+    if not m:
+        raise SystemExit(f"{mode}: add-cloud without -f: {ln}")
+    path = m.group(1)
+    base = os.path.basename(path)
+    kind_m = re.fullmatch(r"cloud-(maas|openstack)\.yaml", base)
+    if not kind_m:
+        raise SystemExit(f"{mode}: unexpected cloud file {path}")
+    kind = kind_m.group(1)
+    expect = os.path.join(art, "cloud-" + kind + ".yaml")
+    if os.path.realpath(path) != os.path.realpath(expect):
+        raise SystemExit(f"{mode}: add-cloud -f {path} != {expect}")
+    if not os.path.isfile(path):
+        raise SystemExit(f"{mode}: cloud file missing after run: {path}")
+    typ = None
+    for line in open(path):
+        mm = re.match(r"^\s*type:\s*(\S+)\s*$", line)
+        if mm:
+            typ = mm.group(1)
+            break
+    if typ != kind:
+        raise SystemExit(f"{mode}: {path} type {typ!r} != {kind}")
+print(f"ok: {mode} cloud files in artifacts")
+PY
+	case $mode in
+	bug | fixed | noupload | snap-unreadable)
+		[[ -f $art/cloud-maas.yaml ]] || die "$mode: cloud-maas.yaml missing"
+		[[ ! -e $art/cloud-openstack.yaml ]] || die "$mode: cloud-openstack.yaml present"
+		;;
+	fallback | addcloud-fail)
+		[[ -f $art/cloud-maas.yaml ]] || die "$mode: cloud-maas.yaml missing"
+		[[ -f $art/cloud-openstack.yaml ]] || die "$mode: cloud-openstack.yaml missing"
+		;;
+	*)
+		die "$mode: no cloud-file expectation"
+		;;
+	esac
+	grep -qF 'cloud definition (maas): -rw' "$art/timeline.log" || die "$mode: timeline missing cloud definition listing"
+	case $mode in
+	bug | fixed | noupload | fallback)
+		grep -qF 'credential definition: -rw-------' "$art/timeline.log" || die "$mode: timeline missing credential listing"
+		;;
+	esac
+}
+
+assert_priv_gone() {
+	local mode=$1 root art
+	root=$tmp/$mode
+	art=$root/art
+	if find "$root" -maxdepth 1 -name 'art-repro-23717-priv.*' -print | grep -q .; then
+		die "$mode: priv dir left beside artifacts"
+	fi
+	if find "$art" -name 'credential-def.yaml' -print | grep -q .; then
+		die "$mode: credential-def.yaml under artifacts"
+	fi
+	python3 - "$tmp/$mode/state/calls.log" "$mode" "$root" "$art" << 'PY'
+import os, re, sys
+lines = open(sys.argv[1]).read().splitlines()
+mode, root, art = sys.argv[2], os.path.realpath(sys.argv[3]), os.path.realpath(sys.argv[4])
+creds = [ln for ln in lines if ln.startswith("juju add-credential ")]
+if not creds:
+    print(f"ok: {mode} no priv dir left")
+    raise SystemExit(0)
+if len(creds) != 1:
+    raise SystemExit(f"{mode}: add-credential lines {creds}")
+m = re.search(r"(?:^|\s)-f (\S+)", creds[0])
+if not m:
+    raise SystemExit(f"{mode}: add-credential without -f")
+priv = os.path.dirname(m.group(1))
+base = os.path.basename(priv)
+if not re.fullmatch(r"art-repro-23717-priv\..+", base):
+    raise SystemExit(f"{mode}: cred dir name {priv}")
+if os.path.realpath(os.path.dirname(priv)) != root:
+    raise SystemExit(f"{mode}: cred dir parent {os.path.dirname(priv)} != {root}")
+if os.path.exists(priv):
+    raise SystemExit(f"{mode}: priv dir still exists: {priv}")
+abs_priv = os.path.abspath(priv)
+if abs_priv == art or abs_priv.startswith(art + os.sep):
+    raise SystemExit(f"{mode}: credential dir is inside artifacts: {priv}")
+print(f"ok: {mode} priv dir removed")
 PY
 }
 
@@ -291,17 +399,22 @@ assert_artifacts_clean() {
 		"$repo/scripts/redact.pl" --pk "$f" || pk=$?
 		[[ $pk -eq 1 ]] || die "redact.pl --pk on $f exited $pk"
 	done < <(find "$art" -type f -print0)
-	local st=$tmp/scrub-$mode
+	local st=$tmp/scrub-$mode up=$tmp/up-$mode
 	mkdir -p "$st"
+	# Scrub the artifact root so the upload keeps .../i1/cloud-maas.yaml.
 	GITHUB_OUTPUT=$tmp/scrub-out-$mode \
-		LAB_ARTIFACT_DIR=$art \
-		LAB_UPLOAD_DIR=$tmp/up-$mode \
+		LAB_ARTIFACT_DIR=$tmp/$mode/art \
+		LAB_UPLOAD_DIR=$up \
 		LAB_STATE_DIR=$st \
 		bash "$repo/scripts/scrub.sh" >"$tmp/scrub-$mode.txt"
 	grep -q '^upload_blocked=false$' "$st/scrub.env" || die "$mode: upload_blocked $(cat "$st/scrub.env")"
 	grep -q '^scrub_hits=0$' "$st/scrub.env" || die "$mode: scrub hits $(cat "$st/scrub.env")"
 	grep -q '^scrub_withheld=0$' "$st/scrub.env" || die "$mode: scrub withheld $(cat "$st/scrub.env")"
-	echo "ok: $mode redact.pl --pk clean, scrub_hits=0"
+	[[ -f $up/repro-23717/i1/cloud-maas.yaml ]] || die "$mode: scrubbed upload missing i1/cloud-maas.yaml"
+	if find "$up" -name 'credential-def.yaml' -print | grep -q .; then
+		die "$mode: credential-def.yaml in scrubbed upload"
+	fi
+	echo "ok: $mode redact.pl --pk clean, scrub_hits=0, cloud-maas.yaml kept"
 }
 
 assert_result() {
@@ -330,7 +443,7 @@ mkdir -p "$tmp/noenv/state" "$tmp/noenv/art" "$tmp/noenv/log"
 : >"$tmp/noenv/state/calls.log"
 noenv_ec=0
 set +e
-FAKE_STATE=$tmp/noenv/state FAKE_MODE=bug PATH="$tmp/bin:$PATH" \
+FAKE_STATE=$tmp/noenv/state FAKE_MODE=bug FAKE_READABLE=$tmp/noenv PATH="$tmp/bin:$PATH" \
 	env -u LAB_CONTROLLER -u LAB_ITERATION -u LAB_ARTIFACT_DIR -u LAB_TIMEOUT_MIN \
 	-u LAB_JUJU_VERSION -u LAB_JUJU_GIT_COMMIT \
 	bash "$here/run.sh" >"$tmp/noenv/log/stdout" 2>"$tmp/noenv/log/stderr"
@@ -373,7 +486,8 @@ if len(shows) != 1 or "--format yaml" not in shows[0] or "--show-secrets" in sho
 print("ok: bug maas oauth1, scoped awk, show-credential yaml")
 PY
 assert_cleanup bug
-assert_temp_gone bug
+assert_cloud_files bug
+assert_priv_gone bug
 assert_artifacts_clean bug
 echo "ok: bug exit 1 reproduced"
 
@@ -390,7 +504,8 @@ grep -q 'parser=awk' "$(art_of fixed)/timeline.log" && die "fixed fell back to a
 # used the yq block, which is the only way region_seen is r-two while awk was skipped.
 grep -q 'client-credentials:' "$(art_of fixed)/show-credential.yaml" || die "fixed decoy missing"
 assert_cleanup fixed
-assert_temp_gone fixed
+assert_cloud_files fixed
+assert_priv_gone fixed
 assert_artifacts_clean fixed
 echo "ok: fixed exit 0 not_reproduced"
 
@@ -403,7 +518,8 @@ assert_result noupload '
 '
 grep -q 'not uploaded' "$(art_of noupload)/add-credential.log" || die "noupload log missing the phrase"
 assert_cleanup noupload
-assert_temp_gone noupload
+assert_cloud_files noupload
+assert_priv_gone noupload
 assert_artifacts_clean noupload
 echo "ok: noupload exit 2"
 
@@ -425,7 +541,8 @@ if any(ln.startswith("juju add-credential ") for ln in text):
 print("ok: addcloud-fail retried openstack")
 PY
 assert_cleanup addcloud-fail
-assert_temp_gone addcloud-fail
+assert_cloud_files addcloud-fail
+assert_priv_gone addcloud-fail
 assert_artifacts_clean addcloud-fail
 echo "ok: addcloud-fail exit 2"
 
@@ -447,8 +564,63 @@ if "cred-auth userpass" not in text or "cred-has-maas-oauth-key" in text:
 print("ok: fallback openstack userpass")
 PY
 assert_cleanup fallback
-assert_temp_gone fallback
+assert_cloud_files fallback
+assert_priv_gone fallback
 assert_artifacts_clean fallback
 echo "ok: fallback exit 1 reproduced"
+
+run_mode snap-unreadable
+snap_ec=$(<"$tmp/snap-unreadable/exit")
+[[ $snap_ec -eq 2 ]] || die "snap-unreadable exit $snap_ec (want 2)"
+assert_result snap-unreadable '
+	.result == "error" and .exit_code == 2 and .phase == "setup" and
+	.reason == "juju could not open cloud definition" and .cloud_type == null and
+	.credential_on_controller == null and .region_seen == null
+'
+python3 - "$tmp/snap-unreadable/state/calls.log" << 'PY'
+import sys
+text = open(sys.argv[1]).read().splitlines()
+types = [ln for ln in text if ln.startswith("add-cloud-type ")]
+if types != ["add-cloud-type maas"]:
+    raise SystemExit(f"snap-unreadable types {types}")
+if any(ln.startswith("juju add-credential ") for ln in text):
+    raise SystemExit("snap-unreadable added a credential")
+print("ok: snap-unreadable maas only, no add-credential")
+PY
+assert_cleanup snap-unreadable
+assert_cloud_files snap-unreadable
+assert_priv_gone snap-unreadable
+assert_artifacts_clean snap-unreadable
+echo "ok: snap-unreadable exit 2"
+
+if [[ $(id -u) -eq 0 ]]; then
+	echo "skip: priv-mkdir-fail (uid 0 ignores directory modes)"
+else
+	dir=$tmp/priv-mkdir-fail
+	mkdir -p "$dir/state" "$dir/ro/art" "$dir/log"
+	: >"$dir/state/calls.log"
+	chmod 555 "$dir/ro"
+	priv_ec=0
+	set +e
+	FAKE_STATE=$dir/state FAKE_MODE=bug FAKE_READABLE=$dir PATH="$tmp/bin:$PATH" \
+		LAB_CONTROLLER=lab LAB_ITERATION=1 LAB_ARTIFACT_DIR=$dir/ro/art \
+		LAB_TIMEOUT_MIN=20 LAB_JUJU_VERSION=4.0.0 LAB_JUJU_GIT_COMMIT=abc23717 \
+		bash "$here/run.sh" >"$dir/log/stdout" 2>"$dir/log/stderr"
+	priv_ec=$?
+	set -e
+	chmod 755 "$dir/ro"
+	printf '%s\n' "$priv_ec" >"$dir/exit"
+	echo "ran: priv-mkdir-fail exit=$priv_ec"
+	[[ $priv_ec -eq 2 ]] || die "priv-mkdir-fail exit $priv_ec (want 2)"
+	[[ ! -s $dir/state/calls.log ]] || die "priv-mkdir-fail invoked juju: $(cat "$dir/state/calls.log")"
+	jq -e '
+		.result == "error" and .exit_code == 2 and .phase == "setup" and
+		.reason == "private dir failed"
+	' "$dir/ro/art/repro-23717/i1/result.json" >/dev/null || die "priv-mkdir-fail result $(jq -c . "$dir/ro/art/repro-23717/i1/result.json")"
+	if find "$dir/ro" -maxdepth 1 -name 'art-repro-23717-priv.*' -print | grep -q .; then
+		die "priv-mkdir-fail left a priv dir"
+	fi
+	echo "ok: priv-mkdir-fail exit 2"
+fi
 
 echo "stub-test: ok"
