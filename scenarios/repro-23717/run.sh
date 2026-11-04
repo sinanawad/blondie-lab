@@ -43,7 +43,7 @@ CRED="cred23717-i${LAB_ITERATION}"
 OUT="$LAB_ARTIFACT_DIR/repro-23717/i${LAB_ITERATION}"
 mkdir -p "$OUT" || exit 2
 
-TMP=
+PRIV=
 CLEANED=0
 CLOUD_TYPE=
 AUTH_TYPE=
@@ -118,8 +118,10 @@ write_result() {
 	RESULT_SAVED=1
 }
 
-# remove-credential, then remove-cloud, then the temp dir. The credential
-# file lives only under TMP and is never copied into the artifact dir.
+# remove-credential, then remove-cloud, then the private dir. The credential
+# file lives only under PRIV, a sibling of the artifact dir, and is never
+# copied into it. PRIV is created before any juju call, so a missing PRIV
+# means nothing was added and there is nothing to remove.
 cleanup() {
 	if [[ ${CLEANED:-0} == 1 ]]; then
 		return 0
@@ -128,7 +130,7 @@ cleanup() {
 	if [[ -n ${OUT:-} ]]; then
 		mkdir -p "$OUT" || true
 	fi
-	if [[ -n ${CLOUD:-} && -n ${CRED:-} && -n ${CTRL:-} && -n ${OUT:-} ]]; then
+	if [[ -n ${PRIV:-} && -n ${CLOUD:-} && -n ${CRED:-} && -n ${CTRL:-} && -n ${OUT:-} ]]; then
 		log "cleanup: remove-credential $CRED"
 		run_log "$OUT/remove-credential.log" remove-credential "$CLOUD" "$CRED" --controller "$CTRL" ||
 			log "cleanup: remove-credential returned non-zero"
@@ -136,8 +138,8 @@ cleanup() {
 		run_log "$OUT/remove-cloud.log" remove-cloud "$CLOUD" --controller "$CTRL" ||
 			log "cleanup: remove-cloud returned non-zero"
 	fi
-	if [[ -n ${TMP:-} && -d ${TMP:-} ]]; then
-		rm -rf -- "$TMP" || true
+	if [[ -n ${PRIV:-} && -d ${PRIV:-} ]]; then
+		rm -rf -- "$PRIV" || true
 	fi
 	return 0
 }
@@ -211,7 +213,7 @@ finish() {
 }
 
 write_maas_cloud() {
-	cat >"$TMP/cloud.yaml" <<EOF
+	cat >"$1" <<EOF || finish 2 error "write cloud definition failed"
 clouds:
   ${CLOUD}:
     type: maas
@@ -226,7 +228,7 @@ EOF
 }
 
 write_openstack_cloud() {
-	cat >"$TMP/cloud.yaml" <<EOF
+	cat >"$1" <<EOF || finish 2 error "write cloud definition failed"
 clouds:
   ${CLOUD}:
     type: openstack
@@ -240,9 +242,9 @@ EOF
 }
 
 write_cred() {
-	local dest=$TMP/credential-def.yaml
+	local dest=$PRIV/credential-def.yaml
 	if [[ $AUTH_TYPE == oauth1 ]]; then
-		cat >"$dest" <<EOF
+		cat >"$dest" <<EOF || finish 2 error "write credential definition failed"
 credentials:
   ${CLOUD}:
     ${CRED}:
@@ -250,7 +252,7 @@ credentials:
       maas-oauth: "lab:lab:lab"
 EOF
 	else
-		cat >"$dest" <<EOF
+		cat >"$dest" <<EOF || finish 2 error "write credential definition failed"
 credentials:
   ${CLOUD}:
     ${CRED}:
@@ -263,6 +265,17 @@ credentials:
 EOF
 	fi
 	chmod 600 "$dest" || finish 2 error "credential file mode failed"
+	assert_file "$dest" "credential definition"
+}
+
+# ls -la prints mode, owner, size, and path, never content.
+assert_file() {
+	local f=$1 what=$2
+	if [[ ! -f $f || ! -s $f ]]; then
+		log "$what missing: $f"
+		finish 2 error "$what missing before juju"
+	fi
+	log "$what: $(ls -la -- "$f" 2>&1)"
 }
 
 # add-cloud exits 0 without adding the cloud when the controller reports an
@@ -283,13 +296,20 @@ cloud_attempt_ok() {
 try_add_cloud() {
 	local kind=$1
 	local dest=$OUT/add-cloud-$kind.log
+	local f=$OUT/cloud-$kind.yaml
 	local rc=0
 	if [[ $kind == maas ]]; then
-		write_maas_cloud
+		write_maas_cloud "$f"
 	else
-		write_openstack_cloud
+		write_openstack_cloud "$f"
 	fi
-	run_log "$dest" add-cloud --controller "$CTRL" "$CLOUD" -f "$TMP/cloud.yaml" --force || rc=$?
+	assert_file "$f" "cloud definition ($kind)"
+	run_log "$dest" add-cloud --controller "$CTRL" "$CLOUD" -f "$f" --force || rc=$?
+	# A path the snap cannot see fails both cloud kinds the same way. Do not
+	# hide that behind the OpenStack fallback.
+	if grep -qF "open $f: no such file or directory" "$dest"; then
+		finish 2 error "juju could not open cloud definition"
+	fi
 	if cloud_attempt_ok "$dest" "$rc"; then
 		return 0
 	fi
@@ -382,11 +402,14 @@ block_has_rtwo() {
 }
 
 main() {
-	local rc=0 auth block
+	local rc=0 auth block credf
 	log "start cloud=$CLOUD cred=$CRED timeout_min=$LAB_TIMEOUT_MIN"
-	TMP=$(mktemp -d) || finish 2 error "mktemp failed"
-	[[ -n $TMP && -d $TMP ]] || finish 2 error "mktemp failed"
-	chmod 700 "$TMP" || finish 2 error "mktemp failed"
+	PRIV=$(mktemp -d "${LAB_ARTIFACT_DIR%/}-repro-23717-priv.XXXXXX") || finish 2 error "private dir failed"
+	[[ -n $PRIV && -d $PRIV ]] || finish 2 error "private dir failed"
+	chmod 700 "$PRIV" || finish 2 error "private dir failed"
+	case "$(realpath -- "$PRIV")/" in
+	"$(realpath -- "$LAB_ARTIFACT_DIR")"/*) finish 2 error "private dir inside artifacts" ;;
+	esac
 
 	if try_add_cloud maas; then
 		CLOUD_TYPE=maas
@@ -405,8 +428,12 @@ main() {
 	log "cloud_type=$CLOUD_TYPE"
 	write_cred
 
+	credf=$PRIV/credential-def.yaml
 	rc=0
-	run_log "$OUT/add-credential.log" add-credential "$CLOUD" -f "$TMP/credential-def.yaml" --region r-two --controller "$CTRL" || rc=$?
+	run_log "$OUT/add-credential.log" add-credential "$CLOUD" -f "$credf" --region r-two --controller "$CTRL" || rc=$?
+	if grep -qF "open $credf: no such file or directory" "$OUT/add-credential.log"; then
+		finish 2 error "juju could not open credential definition"
+	fi
 	if grep -qF 'not uploaded' "$OUT/add-credential.log"; then
 		finish 2 error "credential not uploaded"
 	fi
